@@ -1,0 +1,48 @@
+bridge:
+  # Port to host the bridge on
+  # Used for communication between the homeserver and the bridge
+  # Keep behind a firewall
+  port: 8437
+  # The host connections to the bridge's webserver are allowed from
+  bindAddress: 0.0.0.0
+  # Public domain of the homeserver
+  homeserverName: localhost:8081
+  # Reachable URL of the Matrix homeserver
+  homeserverUrl: http://localhost:8081
+
+# PUBLICLY ACCESSIBLE HTTP server for webhooks and stuff
+# In production, you want HTTPS behind a reverse proxy.
+httpserver:
+  # Port used for the HTTP server
+  port: 8438
+  # Bind address for the HTTP server
+  bindAddress: 0.0.0.0
+  # PUBLICLY ACCESSIBLE URL to the server's root
+  publicBaseURL: https://example.com/my_pstn_bridge/
+
+permissions:
+  # Modules to allow. Defaults to all.
+  modules:
+   - "twilio"
+  # Regex of Matrix IDs allowed to create control rooms
+  # `action` can be `DENY`, `USE` (can only use the bridge), `FULL` (also
+  # can create new bridges)
+  # Default end rule is to give everyone full access
+  # YOU SHOULD EDIT THIS FOR PRODUCTION!
+  # and please be very careful with your regexes
+  user_rules:
+    - regex: '^@kb1rd:localhost:8081$'
+      action: 'FULL'
+    - regex: '.*'
+      action: 'DENY'
+
+database:
+  # Use SQLite3 as a database backend
+  # The name of the database file
+  filename: database.db
+
+logging:
+  # Log level for Matrix Bot SDK's logger (which this bridge uses)
+  # TRACE, DEBUG, INFO, WARN, ERROR
+  # Defaults to INFO
+  level: INFO
