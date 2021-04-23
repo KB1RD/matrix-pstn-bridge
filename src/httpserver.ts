@@ -5,10 +5,26 @@ import { IConfigData } from './config';
 import { IBridgeDatabase } from './database';
 import * as concat from 'concat-stream';
 
+export interface IResponseData {
+  body: string;
+  type?: string;
+}
 
 interface IBridgeHTTPServerEvents {
-  on(event: 'webhook', listener: (room: string, body: Buffer) => void): this;
-  once(event: 'webhook', listener: (d: { room: string, body: Buffer }) => void): this;
+  on(
+    event: 'webhook',
+    listener: (
+      d: { room: string, body: Buffer },
+      respond: (data?: IResponseData) => void,
+    ) => void,
+  ): this;
+  once(
+    event: 'webhook',
+    listener: (
+      d: { room: string, body: Buffer },
+      respond: (data?: IResponseData) => void,
+    ) => void,
+  ): this;
 };
 
 /**
@@ -40,10 +56,17 @@ export class BridgeHTTPServer extends EventEmitter implements IBridgeHTTPServerE
         res.sendStatus(403);
         return;
       }
-      // 204 no content -- Prevents Twilio from texting "Ok" right back.
-      res.sendStatus(204);
 
-      self.emit('webhook', { room: room, body });
+      function respond(data?: IResponseData) {
+        if (!data) {
+          res.sendStatus(204);
+          return;
+        }
+        res.contentType(data.type || 'text/plain');
+        res.status(200);
+        res.send(data.body);
+      }
+      self.emit('webhook', { room: room, body }, respond);
     });
 
     httpserver.listen(config.httpserver.port, config.httpserver.bindAddress);

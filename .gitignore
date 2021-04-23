@@ -3,3 +3,4 @@ config.yaml
 node_modules
 build
 *.db
+yarn-error.log

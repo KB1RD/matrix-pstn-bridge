@@ -1,10 +1,11 @@
-import * as Express from 'express';
 import {
   Appservice,
   IAppserviceOptions,
   MessageEvent,
   Intent,
   LogService,
+  RoomEvent,
+  MessageEventContent,
 } from 'matrix-bot-sdk';
 
 import * as phone from './phonenumber';
@@ -12,6 +13,8 @@ import { getModule, listModules, IModule, IWebhookResponse } from './modules';
 import { ICompleteConfig, getUserAction } from './config';
 import { IBridgeDatabase, IBridgedRoomConfigWithControl } from './database';
 import { BridgeHTTPServer } from './httpserver';
+
+const PREFIX_REMOTE_CALL = 'net.kb1rd.callbridge.remote.';
 
 export interface IUserInfo {
   displayname: string
@@ -80,25 +83,28 @@ export class Bridge extends Appservice {
     const self = this;
     this.addPreprocessor({
       getSupportedEventTypes(): string[] {
-        return ['m.room.message'];
+        return ['m.room.message', 'm.call.answer'];
       },
-      async processEvent(event: any): Promise<void> {
-        const roomId = event?.room_id;
+      async processEvent(e_raw: any): Promise<void> {
+        const roomId = e_raw?.room_id;
         if (typeof roomId !== 'string') {
           return;
         }
 
-        const msg = new MessageEvent(event);
+        const event = new RoomEvent<object>(e_raw);
         if (
-          msg.isRedacted ||
-          !msg.sender ||
-          typeof self.getBridgeUserId(msg.sender) === 'string'
+          !event.sender ||
+          !event.type ||
+          typeof self.getBridgeUserId(event.sender) === 'string'
         ) {
           return;
         }
-        LogService.debug('PstnBridge', `Got message event in room ${roomId}`);
+        LogService.debug(
+          'PstnBridge',
+          `Got event of type '${event.type}' in room ${roomId}`,
+        );
 
-        if (getUserAction(self.opts.config, msg.sender) === 'DENY') {
+        if (getUserAction(self.opts.config, event.sender) === 'DENY') {
           LogService.info('PstnBridge', `Denied message sending in ${roomId}`);
           self.botClient.sendNotice(roomId, 'Access denied');
           return;
@@ -108,7 +114,11 @@ export class Bridge extends Appservice {
 
         // So not a bridged room
         if (!config) {
-          if (msg.messageType === 'm.text') {
+          let msg: MessageEvent<MessageEventContent>
+          if (
+            event.type === 'm.room.message' &&
+            (msg = new MessageEvent(e_raw)).messageType === 'm.text'
+          ) {
             LogService.debug('PstnBridge', `Processing event as control message`);
             await self.processControlMessage(msg.textBody, roomId, msg.sender);
           }
@@ -116,19 +126,16 @@ export class Bridge extends Appservice {
         }
 
         LogService.debug('PstnBridge', `Processing event as bridged message`);
-        switch (msg.messageType) {
-          case 'm.text':
-            await self.processTextMessage(msg.textBody, roomId, config);
-            break;
-        }
+        await self.processBridgedEvent(event, roomId, config);
       },
     });
     
-    this.opts.httpserver.on('webhook', async ({ room, body }) => {
+    this.opts.httpserver.on('webhook', async ({ room, body }, respond) => {
       // Each webhook is mapped to a control room. Get this config now
       const config = await this.db.getControlRoomConfig(room);
       if (!config) {
         LogService.warn('PstnBridge', `Got webhook hit for room ${room}, which is not configured`);
+        respond();
         return;
       }
 
@@ -136,29 +143,88 @@ export class Bridge extends Appservice {
       const mod = this.getModule(config.module);
       if (!mod) {
         LogService.warn('PstnBridge', `Got webhook hit for room ${room}, which is configured for unloaded module ${config.module}`);
+        respond();
         return;
       }
 
-      let data: IWebhookResponse | null;
+      let did_respond: boolean = false;
+      const gen = mod.processWebhook(
+        { body, config: config.moddata },
+        (d) => { did_respond = true; respond(d); },
+      );
+
+      async function processData(data: IWebhookResponse) {
+        console.log(data);
+        // Now, we can forward to the room
+        // TODO: Fix log entry (a bit confusing) s/room/control and add info
+        LogService.debug('PstnBridge', `Sending event from ${data.from} to room ${room}`);
+        try {
+          const info = await this.getPhoneNumRoom(room, data.from);
+          switch (data.type) {
+            case 'text':
+              info.intent.sendText(info.room, data.text);
+              break;
+            case 'create-call':
+              info.intent.underlyingClient.sendEvent(
+                info.room,
+                'm.call.invite',
+                {
+                  call_id: `${PREFIX_REMOTE_CALL}${data.remote_id}`,
+                  lifetime: data.timeout,
+                  offer: { sdp: data.sdp, type: 'offer' },
+                  version: 0
+                },
+              );
+              break;
+            case 'call-candidates':
+              info.intent.underlyingClient.sendEvent(
+                info.room,
+                'm.call.candidates',
+                {
+                  call_id: `${PREFIX_REMOTE_CALL}${data.remote_id}`,
+                  candidates: data.sdp.map((candidate) => ({
+                    candidate,
+                    // TODO: These are assumptions
+                    sdpMid: 'audio',
+                    sdpMLineIndex: 0,
+                  })),
+                  version: 0
+                },
+              );
+              break;
+          }
+        } catch (e) {
+          LogService.error('PstnBridge', `Failed to send text from ${data.from} to room ${room}: ${e}`);
+        }
+      }
+
+      // Treat the first event a bit differently; The response is assumed to be
+      // the default after the first event comes back.
       try {
-        // Try having the module process the webhook data
-        data = await mod.processWebhook({ body });
+        const { done, value } = await gen.next();
+        if (done) {
+          LogService.warn('PstnBridge', `Got webhook hit for room ${room}, which returned no data.`);
+          respond();
+          return;
+        }
+        processData.call(this, value);
       } catch (e) {
         LogService.error('PstnBridge', `Module ${config.module} failed to process webhook for room ${room}: ${e}`);
         return;
+      } finally {
+        if (!did_respond) {
+          // Respond 204 regardless; Remote side doesn't need to know about err
+          respond();
+        }
       }
-      if (!data) {
-        LogService.warn('PstnBridge', `Got webhook hit for room ${room}, which returned no data.`);
-        return;
-      }
-
-      // Now, we can forward to the room
-      LogService.debug('PstnBridge', `Sending text from ${data.from} to room ${room}`);
+      // Now, process any remaining events
       try {
-        const info = await self.getPhoneNumRoom(room, data.from);
-        info.intent.sendText(info.room, data.text);
+        // Try having the module process the webhook data
+        for await (const data of gen) {
+          processData.call(this, data);
+        }
       } catch (e) {
-        LogService.error('PstnBridge', `Failed to send text from ${data.from} to room ${room}: ${e}`);
+        LogService.error('PstnBridge', `Got error from module ${config.module} when generating additional events from webhook for room ${room}: ${e}`);
       }
     });
   }
@@ -184,7 +250,7 @@ export class Bridge extends Appservice {
     return getModule(n);
   }
 
-  protected get db() {
+  protected get db(): IBridgeDatabase {
     return this.opts.storage;
   }
 
@@ -368,8 +434,8 @@ export class Bridge extends Appservice {
     }
   }
 
-  async processTextMessage(
-    text: string,
+  async processBridgedEvent(
+    event: RoomEvent<object>,
     room: string,
     { remote_number, control_config }: IBridgedRoomConfigWithControl
   ): Promise<void> {
@@ -401,18 +467,47 @@ export class Bridge extends Appservice {
     }
 
     try {
-      LogService.debug('PstnBridge', `Sending message to ${remote_number} from ${room}`);
-      mod.sendMessage(
-        control_config.moddata,
-        control_config.number,
-        remote_number,
-        text
-      );
+      if (event.type === 'm.room.message') {
+        const msg = new MessageEvent(event.raw);
+        switch (msg.messageType) {
+          case 'm.text':
+            LogService.debug('PstnBridge', `Sending message to ${remote_number} from ${room}`);
+            await mod.sendMessage(
+              control_config.moddata,
+              control_config.number,
+              remote_number,
+              msg.textBody,
+            );
+            break;
+        }
+      } else if (event.type === 'm.call.answer') {
+        LogService.debug('PstnBridge', `Answering call from ${remote_number} in ${room}`);
+        const content = event.content as {
+          call_id: string,
+          answer: { sdp: string },
+        };
+        if (
+          typeof content.call_id !== 'string' ||
+          typeof content.answer !== 'object' ||
+          typeof content.answer.sdp !== 'string'
+        ) {
+          LogService.warn('PstnBridge', `Failed to process answer in ${room}: Invalid event`);
+        }
+        if (!content.call_id.startsWith(PREFIX_REMOTE_CALL)) {
+          LogService.warn('PstnBridge', `Failed to process answer in ${room}: Answer was not created by this bridge`);
+        }
+        await mod.callAnswerRemote(
+          content.call_id.substr(PREFIX_REMOTE_CALL.length),
+          content.answer.sdp,
+        );
+      } else {
+        LogService.debug('PstnBridge', `Couldn't process event to ${remote_number} from ${room}. Unknown type ${event.type}`);
+      }
     } catch(e) {
-      LogService.error('PstnBridge', `Failed to send message to ${remote_number} from ${room}: ${e}`);
+      LogService.error('PstnBridge', `Failed to send event of type ${event.type} to ${remote_number} from ${room}: ${e}`);
       intent.sendText(
         room,
-        `Failed to send message: ${e.message}`,
+        `Failed to forward event: ${e.message}`,
         'm.notice'
       );
     }
