@@ -30,8 +30,14 @@ interface ICallCandidatesResponse {
   remote_id: string;
   sdp: string[];
 }
+interface ICallAnswerResponse {
+  type: 'call-answer';
+  from: string;
+  local_id: string;
+  sdp: string;
+}
 
-export type IWebhookResponse = ITextResponse | ICreateCallResponse | ICallCandidatesResponse;
+export type IWebhookResponse = ITextResponse | ICreateCallResponse | ICallCandidatesResponse | ICallAnswerResponse;
 
 export { IResponseData };
 
@@ -48,5 +54,7 @@ export interface IModule {
 
   sendMessage(data: object, from: string, to: string, body: string): Promise<void>;
   callAnswerRemote(rid: string, sdp: string): Promise<void>;
+
+  callCreateLocal(data: object, from: string, to: string, lid: string, sdp: string): AsyncIterableIterator<IWebhookResponse>;
 };
 

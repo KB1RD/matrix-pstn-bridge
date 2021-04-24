@@ -16,6 +16,7 @@ interface ITwilioData {
 };
 
 const streams = new Map<string, TwilioSignallingStream>();
+const local_streams = new Map<string, TwilioSignallingStream>();
 
 const mod: IModule = {
   friendly_name: 'Twilio',
@@ -173,5 +174,31 @@ const mod: IModule = {
     const twilio = Twilio(data.sid, data.authToken);
     await twilio.messages.create({ body, from, to });
   },
+
+  async *callCreateLocal(
+    data: object,
+    from: string,
+    to: string,
+    lid: string,
+    sdp: string,
+  ): AsyncIterableIterator<IWebhookResponse> {
+    const id = Str.random(64);
+    const sigstr = createSignallingStream(data as ITwilioData, id);
+    await sigstr.begin();
+    local_streams.set(lid, sigstr);
+
+    sigstr.send('invite', {
+      sdp,
+      callsid: `net.kb1rd.callbridge.local.${lid}`,
+      preflight: false,
+      twilio: { callerId: from },
+    });
+
+    const msg = (await sigstr.on_message('answer')) as { sdp: string };
+    if (typeof msg !== 'object' || typeof msg.sdp !== 'string') {
+      throw new Error('Invalid return message from Twilio')
+    }
+    yield { type: 'call-answer', from, local_id: lid, sdp: msg.sdp };
+  }
 };
 export default mod;

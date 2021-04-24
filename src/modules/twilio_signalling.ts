@@ -10,7 +10,7 @@ export interface IInvitePayload {
   sdp: string;
   preflight: boolean;
   // https://github.com/twilio/twilio-client.js/blob/d90e723a7bf5ee0651159d0bbc91512ffa079cea/lib/twilio/connection.ts#L616
-  twilio: string;
+  twilio: object;
 }
 
 export interface ISendMsgFunc {

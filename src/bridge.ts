@@ -83,7 +83,7 @@ export class Bridge extends Appservice {
     const self = this;
     this.addPreprocessor({
       getSupportedEventTypes(): string[] {
-        return ['m.room.message', 'm.call.answer'];
+        return ['m.room.message', 'm.call.answer', 'm.call.invite', 'm.call.candidates', 'm.call.hangup'];
       },
       async processEvent(e_raw: any): Promise<void> {
         const roomId = e_raw?.room_id;
@@ -153,51 +153,6 @@ export class Bridge extends Appservice {
         (d) => { did_respond = true; respond(d); },
       );
 
-      async function processData(data: IWebhookResponse) {
-        console.log(data);
-        // Now, we can forward to the room
-        // TODO: Fix log entry (a bit confusing) s/room/control and add info
-        LogService.debug('PstnBridge', `Sending event from ${data.from} to room ${room}`);
-        try {
-          const info = await this.getPhoneNumRoom(room, data.from);
-          switch (data.type) {
-            case 'text':
-              info.intent.sendText(info.room, data.text);
-              break;
-            case 'create-call':
-              info.intent.underlyingClient.sendEvent(
-                info.room,
-                'm.call.invite',
-                {
-                  call_id: `${PREFIX_REMOTE_CALL}${data.remote_id}`,
-                  lifetime: data.timeout,
-                  offer: { sdp: data.sdp, type: 'offer' },
-                  version: 0
-                },
-              );
-              break;
-            case 'call-candidates':
-              info.intent.underlyingClient.sendEvent(
-                info.room,
-                'm.call.candidates',
-                {
-                  call_id: `${PREFIX_REMOTE_CALL}${data.remote_id}`,
-                  candidates: data.sdp.map((candidate) => ({
-                    candidate,
-                    // TODO: These are assumptions
-                    sdpMid: 'audio',
-                    sdpMLineIndex: 0,
-                  })),
-                  version: 0
-                },
-              );
-              break;
-          }
-        } catch (e) {
-          LogService.error('PstnBridge', `Failed to send text from ${data.from} to room ${room}: ${e}`);
-        }
-      }
-
       // Treat the first event a bit differently; The response is assumed to be
       // the default after the first event comes back.
       try {
@@ -207,7 +162,7 @@ export class Bridge extends Appservice {
           respond();
           return;
         }
-        processData.call(this, value);
+        this.processWebhookResponse(value, room);
       } catch (e) {
         LogService.error('PstnBridge', `Module ${config.module} failed to process webhook for room ${room}: ${e}`);
         return;
@@ -221,7 +176,7 @@ export class Bridge extends Appservice {
       try {
         // Try having the module process the webhook data
         for await (const data of gen) {
-          processData.call(this, data);
+          this.processWebhookResponse(data, room);
         }
       } catch (e) {
         LogService.error('PstnBridge', `Got error from module ${config.module} when generating additional events from webhook for room ${room}: ${e}`);
@@ -284,6 +239,64 @@ export class Bridge extends Appservice {
       );
     }
     return null;
+  }
+
+  async processWebhookResponse(
+    data: IWebhookResponse,
+    room: string
+  ): Promise<void> {
+    // Now, we can forward to the room
+    // TODO: Fix log entry (a bit confusing) s/room/control and add info
+    LogService.debug('PstnBridge', `Sending event from ${data.from} to room ${room}`);
+    try {
+      const info = await this.getPhoneNumRoom(room, data.from);
+      switch (data.type) {
+        case 'text':
+          info.intent.sendText(info.room, data.text);
+          break;
+        case 'create-call':
+          info.intent.underlyingClient.sendEvent(
+            info.room,
+            'm.call.invite',
+            {
+              call_id: `${PREFIX_REMOTE_CALL}${data.remote_id}`,
+              lifetime: data.timeout,
+              offer: { sdp: data.sdp, type: 'offer' },
+              version: 0,
+            },
+          );
+          break;
+        case 'call-candidates':
+          info.intent.underlyingClient.sendEvent(
+            info.room,
+            'm.call.candidates',
+            {
+              call_id: `${PREFIX_REMOTE_CALL}${data.remote_id}`,
+              candidates: data.sdp.map((candidate) => ({
+                candidate,
+                // TODO: These are assumptions
+                sdpMid: 'audio',
+                sdpMLineIndex: 0,
+              })),
+              version: 0,
+            },
+          );
+          break;
+        case 'call-answer':
+          info.intent.underlyingClient.sendEvent(
+            info.room,
+            'm.call.answer',
+            {
+              call_id: data.local_id,
+              answer: { sdp: data.sdp, type: 'answer' },
+              version: 0,
+            },
+          );
+          break;
+      }
+    } catch (e) {
+      LogService.error('PstnBridge', `Failed to send text from ${data.from} to room ${room}: ${e}`);
+    }
   }
 
   /**
@@ -437,7 +450,7 @@ export class Bridge extends Appservice {
   async processBridgedEvent(
     event: RoomEvent<object>,
     room: string,
-    { remote_number, control_config }: IBridgedRoomConfigWithControl
+    { remote_number, control_config, control_room}: IBridgedRoomConfigWithControl
   ): Promise<void> {
     const intent = this.getIntentForSuffix(this.getTelSuffix(remote_number));
     if (!(await intent.getJoinedRooms()).includes(room)) {
@@ -500,6 +513,39 @@ export class Bridge extends Appservice {
           content.call_id.substr(PREFIX_REMOTE_CALL.length),
           content.answer.sdp,
         );
+      } else if (event.type === 'm.call.invite') {
+        LogService.debug('PstnBridge', `Creating call to ${remote_number} in ${room}`);
+        const content = event.content as {
+          call_id: string,
+          offer: { sdp: string },
+        };
+        if (
+          typeof content.call_id !== 'string' ||
+          typeof content.offer !== 'object' ||
+          typeof content.offer.sdp !== 'string'
+        ) {
+          LogService.warn('PstnBridge', `Failed to process call invite in ${room}: Invalid event`);
+        }
+        const gen = mod.callCreateLocal(
+          control_config.moddata,
+          control_config.number,
+          remote_number,
+          content.call_id,
+          content.offer.sdp
+        );
+        async function handle() {
+          try {
+            for await (const data of gen) {
+              this.processWebhookResponse(data, control_room);
+            }
+          } catch(e) {
+            LogService.error('PstnBridge', `Failed to handle event streamed from message sent in ${room}`);
+          }
+        }
+        // Return async now, let the handler run.
+        handle.call(this);
+      } else if (event.type === 'm.call.candidates') {
+        console.log('CANDIDATES', event.content);
       } else {
         LogService.debug('PstnBridge', `Couldn't process event to ${remote_number} from ${room}. Unknown type ${event.type}`);
       }
