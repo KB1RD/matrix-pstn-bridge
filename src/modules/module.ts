@@ -1,45 +1,21 @@
-import { IResponseData } from '../httpserver';
+import * as express from 'express';
+
+import { PhoneCall, PhoneCallEventArgs } from '../call';
 
 export interface ILinkOpts {
   webhook: string;
 };
 
-export interface IWebhookData {
-  body: Buffer;
-  config: object;
-};
-
-interface ITextResponse {
-  type: 'text';
-  from: string;
-  text: string;
-};
-interface ICreateCallResponse {
-  type: 'create-call';
-  from: string;
-  remote_id: string;
-  sdp: string;
-  /**
-   * Time in **ms** for invite expiry.
-   */
-  timeout: number;
-}
-interface ICallCandidatesResponse {
-  type: 'call-candidates';
-  from: string;
-  remote_id: string;
-  sdp: string[];
-}
-interface ICallAnswerResponse {
-  type: 'call-answer';
-  from: string;
-  local_id: string;
-  sdp: string;
+export interface IWebhookHandlers {
+  sendText(control: string, from: string, body: string): void;
+  createCall(
+    control: string,
+    from: string,
+  ): Promise<PhoneCall | null>;
+  getConfig(control: string): Promise<object | null>;
 }
 
-export type IWebhookResponse = ITextResponse | ICreateCallResponse | ICallCandidatesResponse | ICallAnswerResponse;
-
-export { IResponseData };
+export { PhoneCall, express };
 
 export interface IModule {
   friendly_name: string;
@@ -47,14 +23,33 @@ export interface IModule {
   tryLink(opts: ILinkOpts, ...args: string[]): Promise<[string, any]>;
   getStatusMsg(data: object): Promise<string>;
 
-  processWebhook(
-    data: IWebhookData,
-    respond: (data?: IResponseData) => void,
-  ): AsyncIterableIterator<IWebhookResponse>;
+  registerWebhooks(app: express.Application, handlers: IWebhookHandlers): void;
 
-  sendMessage(data: object, from: string, to: string, body: string): Promise<void>;
-  callAnswerRemote(rid: string, sdp: string): Promise<void>;
+  sendMessage(
+    data: object,
+    from: string,
+    to: string,
+    body: string,
+  ): Promise<void>;
 
-  callCreateLocal(data: object, from: string, to: string, lid: string, sdp: string): AsyncIterableIterator<IWebhookResponse>;
+  sendCallInvite(
+    data: object,
+    call: PhoneCall,
+    ...args: PhoneCallEventArgs['send_invite']
+  ): Promise<void>;
+  sendCallCandidates(
+    data: object,
+    call: PhoneCall,
+    ...args: PhoneCallEventArgs['send_candidates']
+  ): Promise<void>;
+  sendCallAccept(
+    data: object,
+    call: PhoneCall,
+    ...args: PhoneCallEventArgs['send_accept']
+  ): Promise<void>;
+  sendCallHangup(
+    data: object,
+    call: PhoneCall,
+    ...args: PhoneCallEventArgs['send_hangup']
+  ): Promise<void>;
 };
-

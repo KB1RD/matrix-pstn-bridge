@@ -13,14 +13,29 @@ export interface IInvitePayload {
   twilio: object;
 }
 
+interface ICandidatePayload {
+  callsid: string;
+  candidate: string;
+  label: number;
+  type: 'candidate';
+}
+
 export interface ISendMsgFunc {
   (type: 'listen', payload: { token: string }): void;
   (type: 'register', payload: { media: { audio: true } }): void;
   (type: 'invite', payload: IInvitePayload): void;
   (type: 'answer', payload: { callsid: string, sdp: string }): void;
+  (type: 'candidate', payload: ICandidatePayload): void;
+  (type: 'hangup', payload: { callsid: string }): void;
+  (type: 'cancel', payload: { callsid: string }): void;
 }
 
 export const PSTREAM_VERSION = '1.5';
+/**
+ * A stream to interact with Twilio's client SDK VoIP signalling.
+ * This was both reverse-engineered from working Twilio clients and from some
+ * source code [here](https://github.com/twilio/twilio-client.js/blob/master/lib/twilio/pstream.js).
+ */
 export class TwilioSignallingStream extends EventEmitter {
   protected _ws?: WS
   test = new Set<(arg: string) => void>();
@@ -52,6 +67,11 @@ export class TwilioSignallingStream extends EventEmitter {
     await this.on_message('connected');
     this.send('register', { media: { audio: true } });
     await this.on_message('ready');
+  }
+  close(): void {
+    if (this._ws) {
+      this._ws.close();
+    }
   }
 
   on_message(type: string): Promise<object> {
@@ -91,11 +111,27 @@ export class TwilioSignallingStream extends EventEmitter {
 }
 
 interface ISigStreamCreationData {
+  /**
+   * **Account** SID
+   */
   sid: string;
+  /**
+   * Twilio [API key](https://www.twilio.com/docs/iam/keys/api-key)
+   */
   apikey: { sid: string, secret: string };
+  /**
+   * [TwiML app](https://support.twilio.com/hc/en-us/articles/223180928-How-Do-I-Create-a-TwiML-App-) SID
+   */
   appSid: string;
 };
 
+/**
+ * Creates a JWT for a Twilio cliebt and creates a signalling stream with that
+ * token.
+ * @param creationdata - Authentication. See `ISigStreamCreationData`
+ * @param identity - The client name to use
+ * @param url - Optional URL for the Twilio websocket
+ */
 export function createSignallingStream(
   { sid, apikey, appSid }: ISigStreamCreationData,
   identity: string,

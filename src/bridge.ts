@@ -7,14 +7,15 @@ import {
   RoomEvent,
   MessageEventContent,
 } from 'matrix-bot-sdk';
+import * as Str from '@supercharge/strings';
 
 import * as phone from './phonenumber';
-import { getModule, listModules, IModule, IWebhookResponse } from './modules';
+import { getModule, listModules, IModule } from './modules';
 import { ICompleteConfig, getUserAction } from './config';
 import { IBridgeDatabase, IBridgedRoomConfigWithControl } from './database';
 import { BridgeHTTPServer } from './httpserver';
-
-const PREFIX_REMOTE_CALL = 'net.kb1rd.callbridge.remote.';
+import { PhoneCall } from './modules/module';
+import { CallState } from './call';
 
 export interface IUserInfo {
   displayname: string
@@ -30,6 +31,9 @@ export interface IBridgeOptions extends IAppserviceOptions {
 export class Bridge extends Appservice {
   // TODO: Make config option.
   protected readonly bot_name = 'PSTN Bridge Bot';
+
+  // Room name <-> call
+  protected readonly active_calls = new Map<string, PhoneCall>();
 
   constructor(protected readonly opts: IBridgeOptions) {
     // `options` is private in `Appservice`. We define it *again* as protected,
@@ -129,59 +133,6 @@ export class Bridge extends Appservice {
         await self.processBridgedEvent(event, roomId, config);
       },
     });
-    
-    this.opts.httpserver.on('webhook', async ({ room, body }, respond) => {
-      // Each webhook is mapped to a control room. Get this config now
-      const config = await this.db.getControlRoomConfig(room);
-      if (!config) {
-        LogService.warn('PstnBridge', `Got webhook hit for room ${room}, which is not configured`);
-        respond();
-        return;
-      }
-
-      // Try looking up the module
-      const mod = this.getModule(config.module);
-      if (!mod) {
-        LogService.warn('PstnBridge', `Got webhook hit for room ${room}, which is configured for unloaded module ${config.module}`);
-        respond();
-        return;
-      }
-
-      let did_respond: boolean = false;
-      const gen = mod.processWebhook(
-        { body, config: config.moddata },
-        (d) => { did_respond = true; respond(d); },
-      );
-
-      // Treat the first event a bit differently; The response is assumed to be
-      // the default after the first event comes back.
-      try {
-        const { done, value } = await gen.next();
-        if (done) {
-          LogService.warn('PstnBridge', `Got webhook hit for room ${room}, which returned no data.`);
-          respond();
-          return;
-        }
-        this.processWebhookResponse(value, room);
-      } catch (e) {
-        LogService.error('PstnBridge', `Module ${config.module} failed to process webhook for room ${room}: ${e}`);
-        return;
-      } finally {
-        if (!did_respond) {
-          // Respond 204 regardless; Remote side doesn't need to know about err
-          respond();
-        }
-      }
-      // Now, process any remaining events
-      try {
-        // Try having the module process the webhook data
-        for await (const data of gen) {
-          this.processWebhookResponse(data, room);
-        }
-      } catch (e) {
-        LogService.error('PstnBridge', `Got error from module ${config.module} when generating additional events from webhook for room ${room}: ${e}`);
-      }
-    });
   }
 
   /**
@@ -217,6 +168,61 @@ export class Bridge extends Appservice {
   }
   
   async begin(): Promise<void> {
+    const self = this;
+    const handlers = {
+      async getConfig(control: string): Promise<object | null> {
+        return (await self.db.getControlRoomConfig(control))?.moddata || null;
+      },
+      async createCall(
+        control: string,
+        from: string,
+      ): Promise<PhoneCall | null> {
+        try {
+          const [info, cfg] = await Promise.all([
+            self.getPhoneNumRoom(control, from),
+            self.db.getControlRoomConfig(control),
+          ]);
+          if (!info || !cfg) {
+            throw new Error('No registered number in room');
+          }
+
+          const call = new PhoneCall(cfg.number, from, Str.random(64));
+          self.addNewCall(info.room, call);
+          return call;
+        } catch (e) {
+          LogService.info(
+            `PstnBridge`,
+            `Failed to create phone call from ${from} to user under control room ${control}.`
+          );
+          return null;
+        }
+      },
+      async sendText(
+        control: string,
+        from: string,
+        body: string,
+      ): Promise<void> {
+        try {
+          const info = await self.getPhoneNumRoom(control, from);
+          info.intent.sendText(info.room, body);
+        } catch (e) {
+          LogService.info(
+            `PstnBridge`,
+            `Failed to send text from ${from} to user under control room ${control}.`
+          );
+        }
+      },
+    };
+
+    const modules = this.listModules();
+    for (const modname of modules) {
+      const mod = this.getModule(modname);
+      (mod as IModule).registerWebhooks(
+        this.opts.httpserver.getModuleApp(modname),
+        handlers,
+      );
+    }
+
     await super.begin();
     await this.botIntent.ensureRegistered();
     await this.botClient.setDisplayName(this.bot_name);
@@ -241,62 +247,88 @@ export class Bridge extends Appservice {
     return null;
   }
 
-  async processWebhookResponse(
-    data: IWebhookResponse,
-    room: string
-  ): Promise<void> {
-    // Now, we can forward to the room
-    // TODO: Fix log entry (a bit confusing) s/room/control and add info
-    LogService.debug('PstnBridge', `Sending event from ${data.from} to room ${room}`);
-    try {
-      const info = await this.getPhoneNumRoom(room, data.from);
-      switch (data.type) {
-        case 'text':
-          info.intent.sendText(info.room, data.text);
-          break;
-        case 'create-call':
-          info.intent.underlyingClient.sendEvent(
-            info.room,
-            'm.call.invite',
-            {
-              call_id: `${PREFIX_REMOTE_CALL}${data.remote_id}`,
-              lifetime: data.timeout,
-              offer: { sdp: data.sdp, type: 'offer' },
-              version: 0,
-            },
-          );
-          break;
-        case 'call-candidates':
-          info.intent.underlyingClient.sendEvent(
-            info.room,
-            'm.call.candidates',
-            {
-              call_id: `${PREFIX_REMOTE_CALL}${data.remote_id}`,
-              candidates: data.sdp.map((candidate) => ({
-                candidate,
-                // TODO: These are assumptions
-                sdpMid: 'audio',
-                sdpMLineIndex: 0,
-              })),
-              version: 0,
-            },
-          );
-          break;
-        case 'call-answer':
-          info.intent.underlyingClient.sendEvent(
-            info.room,
-            'm.call.answer',
-            {
-              call_id: data.local_id,
-              answer: { sdp: data.sdp, type: 'answer' },
-              version: 0,
-            },
-          );
-          break;
+  addNewCall(room: string, call: PhoneCall): boolean {
+    // TODO glare
+    this.active_calls.set(room, call);
+    call.on('ended', () => {
+      if (this.active_calls.get(room) === call) {
+        LogService.info(
+          `PstnBridge CALL/${room}/${call.matrix_id}`,
+          `Call was hung up or failed. Call will be deleted.`
+        );
+        this.active_calls.delete(room);
       }
-    } catch (e) {
-      LogService.error('PstnBridge', `Failed to send text from ${data.from} to room ${room}: ${e}`);
+    });
+
+    const sendEvent = async (type: string, event: object): Promise<void> => {
+      const intent = this.getIntentForSuffix(this.getTelSuffix(call.remote));
+      intent.underlyingClient.sendEvent(room, type, event);
     }
+    call.on('send_invite', async (sdp: string) => {
+      try {
+        await sendEvent('m.call.invite', {
+          call_id: call.matrix_id,
+          // TODO: What should this be?
+          lifetime: 60000,
+          offer: { sdp, type: 'offer' },
+          version: 0,
+        });
+      } catch (e) {
+        LogService.error(
+          `PstnBridge CALL/${room}/${call.matrix_id}`,
+          `Error sending invite: ${e}`
+        );
+      }
+    });
+    call.on('send_candidates', async (candidates_sdp: string[]) => {
+      try {
+        await sendEvent('m.call.candidates', {
+          call_id: call.matrix_id,
+          candidates: candidates_sdp.map((candidate) => ({
+            candidate,
+            // TODO: Verify this stuff
+            sdpMLineIndex: 0,
+            sdpMid: 'audio',
+          })),
+          version: 0,
+        });
+      } catch (e) {
+        LogService.error(
+          `PstnBridge CALL/${room}/${call.matrix_id}`,
+          `Error sending candidates: ${e}`
+        );
+      }
+    });
+    call.on('send_accept', async (sdp: string) => {
+      try {
+        await sendEvent('m.call.answer', {
+          call_id: call.matrix_id,
+          // TODO: What should this be?
+          lifetime: 60000,
+          answer: { sdp, type: 'answer' },
+          version: 0,
+        });
+      } catch (e) {
+        LogService.error(
+          `PstnBridge CALL/${room}/${call.matrix_id}`,
+          `Error sending answer: ${e}`
+        );
+      }
+    });
+    call.on('send_hangup', async () => {
+      try {
+        await sendEvent('m.call.hangup', {
+          call_id: call.matrix_id,
+          version: 0,
+        });
+      } catch (e) {
+        LogService.error(
+          `PstnBridge CALL/${room}/${call.matrix_id}`,
+          `Error sending hangup: ${e}`
+        );
+      }
+    });
+    return true;
   }
 
   /**
@@ -304,6 +336,7 @@ export class Bridge extends Appservice {
    */
   protected readonly commands = {
     async help(
+      this: Bridge,
       { replies }: { room: string, sender: string, replies: string[] },
     ): Promise<void> {
       replies.push(`Available commands:`);
@@ -316,6 +349,7 @@ export class Bridge extends Appservice {
       replies.push(`\nAvailable modules: ${this.listModules().join(', ')}`);
     },
     async status(
+      this: Bridge,
       { room, replies }: { room: string, sender: string, replies: string[] },
     ): Promise<void> {
       const config = await this.db.getControlRoomConfig(room);
@@ -338,6 +372,7 @@ export class Bridge extends Appservice {
     },
 
     async link(
+      this: Bridge,
       { room, replies }: { room: string, sender: string, replies: string[] },
       modname?: string,
       ...modargs: string[]
@@ -350,11 +385,19 @@ export class Bridge extends Appservice {
         return;
       }
 
-      const opts = { webhook: await this.opts.httpserver.createWebhook(room) };
+      const opts = {
+        webhook: await this.opts.httpserver.createWebhook(
+          modname as string,
+          room,
+        ),
+      };
 
       try {
         const [number, moddata] = await mod.tryLink(opts, ...modargs);
-        this.db.setControlRoomConfig(room, { module: modname, number, moddata });
+        this.db.setControlRoomConfig(
+          room,
+          { module: modname as string, number, moddata }
+        );
         LogService.debug('PstnBridge', `Linked ${room} to ${number} via ${modname}`);
       } catch (e) {
         LogService.warn('PstnBridge', `Failed to link module ${modname}: ${e}`);
@@ -365,6 +408,7 @@ export class Bridge extends Appservice {
       replies.push(`Linked to module ${modname}.`);
     },
     async unlink(
+      this: Bridge,
       { room, replies }: { room: string, sender: string, replies: string[] },
     ): Promise<void> {
       this.db.setControlRoomConfig(room, null);
@@ -374,6 +418,7 @@ export class Bridge extends Appservice {
     },
 
     async dial(
+      this: Bridge,
       { room, sender, replies }: { room: string, sender: string, replies: string[] },
       ...numa: string[]
     ): Promise<void> {
@@ -391,6 +436,7 @@ export class Bridge extends Appservice {
     },
 
     async name(
+      this: Bridge,
       { room, replies }: { room: string, sender: string, replies: string[] },
       nums?: string,
       ...namea: string[]
@@ -450,7 +496,7 @@ export class Bridge extends Appservice {
   async processBridgedEvent(
     event: RoomEvent<object>,
     room: string,
-    { remote_number, control_config, control_room}: IBridgedRoomConfigWithControl
+    { remote_number, control_config}: IBridgedRoomConfigWithControl
   ): Promise<void> {
     const intent = this.getIntentForSuffix(this.getTelSuffix(remote_number));
     if (!(await intent.getJoinedRooms()).includes(room)) {
@@ -493,26 +539,6 @@ export class Bridge extends Appservice {
             );
             break;
         }
-      } else if (event.type === 'm.call.answer') {
-        LogService.debug('PstnBridge', `Answering call from ${remote_number} in ${room}`);
-        const content = event.content as {
-          call_id: string,
-          answer: { sdp: string },
-        };
-        if (
-          typeof content.call_id !== 'string' ||
-          typeof content.answer !== 'object' ||
-          typeof content.answer.sdp !== 'string'
-        ) {
-          LogService.warn('PstnBridge', `Failed to process answer in ${room}: Invalid event`);
-        }
-        if (!content.call_id.startsWith(PREFIX_REMOTE_CALL)) {
-          LogService.warn('PstnBridge', `Failed to process answer in ${room}: Answer was not created by this bridge`);
-        }
-        await mod.callAnswerRemote(
-          content.call_id.substr(PREFIX_REMOTE_CALL.length),
-          content.answer.sdp,
-        );
       } else if (event.type === 'm.call.invite') {
         LogService.debug('PstnBridge', `Creating call to ${remote_number} in ${room}`);
         const content = event.content as {
@@ -525,27 +551,37 @@ export class Bridge extends Appservice {
           typeof content.offer.sdp !== 'string'
         ) {
           LogService.warn('PstnBridge', `Failed to process call invite in ${room}: Invalid event`);
+          return;
         }
-        const gen = mod.callCreateLocal(
-          control_config.moddata,
+        const call = new PhoneCall(
           control_config.number,
           remote_number,
-          content.call_id,
-          content.offer.sdp
+          content.call_id
         );
-        async function handle() {
-          try {
-            for await (const data of gen) {
-              this.processWebhookResponse(data, control_room);
-            }
-          } catch(e) {
-            LogService.error('PstnBridge', `Failed to handle event streamed from message sent in ${room}`);
-          }
-        }
-        // Return async now, let the handler run.
-        handle.call(this);
+        call.state = CallState.INVITED;
+        this.addNewCall(room, call);
+        await mod.sendCallInvite(
+          control_config.moddata,
+          call,
+          content.offer.sdp,
+        );
       } else if (event.type === 'm.call.candidates') {
         console.log('CANDIDATES', event.content);
+      } else if (event.type === 'm.call.answer') {
+        console.log('ANSWER', event.content);
+      } else if (event.type === 'm.call.hangup') {
+        const call = this.active_calls.get(room);
+        if (!call) {
+          LogService.warn('PstnBridge', `Failed to process call hangup in ${room}: No known active call in room. Was the bridge restarted with active calls?`);
+          return;
+        }
+        const content = event.content as { call_id: string };
+        if (content.call_id !== call.matrix_id) {
+          LogService.warn('PstnBridge', `Received hangup for call ${content.call_id} in room ${room}, but only ${call.matrix_id} is known to be active in that room. Hanging up anyway.`);
+        }
+        // TODO: Is it even necessary to have a function in the module?
+        await mod.sendCallHangup(control_config.moddata, call);
+        call.state = CallState.HUNGUP;
       } else {
         LogService.debug('PstnBridge', `Couldn't process event to ${remote_number} from ${room}. Unknown type ${event.type}`);
       }

@@ -1,6 +1,6 @@
 const Vonage = require('@vonage/server-sdk');
 
-import { IModule, ILinkOpts, IWebhookData, IWebhookResponse } from './module';
+import { IModule, ILinkOpts } from './module';
 
 import twilio from './twilio';
 import vonage from './vonage'; // unfinished
@@ -15,5 +15,4 @@ export function listModules(): string[] {
   return Object.keys(modules);
 }
 
-export { IModule, ILinkOpts, IWebhookData, IWebhookResponse };
-
+export { IModule, ILinkOpts };

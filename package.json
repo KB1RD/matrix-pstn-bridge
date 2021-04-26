@@ -1,6 +1,6 @@
 {
   "name": "matrix-pstn-bridge",
-  "version": "0.1.0",
+  "version": "0.1.0A",
   "description": "A Matrix Puppet bridge for the public telephone network that supports a number of VoIP providers (Twillo, Vonage, etc.)",
   "main": "index.js",
   "scripts": {
@@ -23,11 +23,10 @@
     "google-libphonenumber": "^3.2.18",
     "hash.js": "^1.1.7",
     "matrix-bot-sdk": "^0.5.17",
-    "semantic-sdp": "^3.19.2",
     "tslint": "^5.17.0",
     "twilio": "^3.60.0",
     "twilio-client": "^1.14.0",
-    "typescript": "^3.7.4",
+    "typescript": "^4.2.4",
     "ws": "^7.4.4",
     "yaml": "^1.10.2"
   },

@@ -1,7 +1,7 @@
 const Vonage = require('@vonage/server-sdk');
 import * as phone from '../phonenumber';
 
-import { ILinkOpts, IWebhookData, IWebhookResponse } from './module';
+import { ILinkOpts } from './module';
 
 interface IVonageData {
   apiKey: string,
@@ -46,9 +46,6 @@ export default {
     return `Module not finished.`;
   },
 
-  async processWebhook({ body }: IWebhookData): Promise<IWebhookResponse | null> {
-    return null;
-  },
   async sendMessage(data: object, from: string, to: string, body: string): Promise<void> {
     console.log(to, body);
   },
