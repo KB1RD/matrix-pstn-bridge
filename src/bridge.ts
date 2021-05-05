@@ -16,6 +16,7 @@ import { IBridgeDatabase, IBridgedRoomConfigWithControl } from './database';
 import { BridgeHTTPServer } from './httpserver';
 import { PhoneCall } from './modules/module';
 import { CallState } from './call';
+import * as voip_ev from './signalling_events';
 
 export interface IUserInfo {
   displayname: string
@@ -541,23 +542,23 @@ export class Bridge extends Appservice {
         }
       } else if (event.type === 'm.call.invite') {
         LogService.debug('PstnBridge', `Creating call to ${remote_number} in ${room}`);
-        const content = event.content as {
-          call_id: string,
-          offer: { sdp: string },
-        };
-        if (
-          typeof content.call_id !== 'string' ||
-          typeof content.offer !== 'object' ||
-          typeof content.offer.sdp !== 'string'
-        ) {
+        const content = event.content as unknown;
+        if (!voip_ev.IVoipInvite.validate(content)) {
           LogService.warn('PstnBridge', `Failed to process call invite in ${room}: Invalid event`);
           return;
         }
+
+        if (content.version !== 0 && content.version !== 1) {
+          LogService.warn('PstnBridge', `Invite in ${room} has unsupported version ${content.version}`);
+          return;
+        }
+
         const call = new PhoneCall(
           control_config.number,
           remote_number,
           content.call_id
         );
+        call.matrix_call_version = content.version;
         call.state = CallState.INVITED;
         this.addNewCall(room, call);
         await mod.sendCallInvite(
@@ -566,22 +567,85 @@ export class Bridge extends Appservice {
           content.offer.sdp,
         );
       } else if (event.type === 'm.call.candidates') {
-        console.log('CANDIDATES', event.content);
+        const call = this.active_calls.get(room);
+        if (!call) {
+          LogService.warn('PstnBridge', `Failed to process call candidates in ${room}: No known active call in room. Was the bridge restarted with active calls?`);
+          return;
+        }
+
+        const content = event.content as unknown;
+        if (!voip_ev.IVoipCandidates.validate(content)) {
+          LogService.warn('PstnBridge', `Failed to process call candidates in ${room}: Invalid event`);
+          return;
+        }
+
+        if (content.version !== 0 && content.version !== 1) {
+          LogService.warn('PstnBridge', `Candidates event in ${room} has unsupported version ${content.version}`);
+          return;
+        }
+        if (content.call_id !== call.matrix_id) {
+          LogService.debug('PstnBridge', `Ignoring candidates event for other call ${content.call_id} in room ${room}`);
+          return;
+        }
+
+        await mod.sendCallCandidates(
+          control_config.moddata,
+          call,
+          content.candidates.map(({ candidate }) => candidate),
+        );
       } else if (event.type === 'm.call.answer') {
-        console.log('ANSWER', event.content);
+        const call = this.active_calls.get(room);
+        if (!call) {
+          LogService.warn('PstnBridge', `Failed to process call answer in ${room}: No known active call in room. Was the bridge restarted with active calls?`);
+          return;
+        }
+
+        const content = event.content as unknown;
+        if (!voip_ev.IVoipAnswer.validate(content)) {
+          LogService.warn('PstnBridge', `Failed to process call answer in ${room}: Invalid event`);
+          return;
+        }
+
+        if (content.version !== 0 && content.version !== 1) {
+          LogService.warn('PstnBridge', `Answer in ${room} has unsupported version ${content.version}`);
+          return;
+        }
+        if (content.call_id !== call.matrix_id) {
+          LogService.debug('PstnBridge', `Ignoring answer for other call ${content.call_id} in room ${room}`);
+          return;
+        }
+
+        call.state = CallState.ACCEPTED;
+        await mod.sendCallAccept(
+          control_config.moddata,
+          call,
+          content.answer.sdp,
+        );
       } else if (event.type === 'm.call.hangup') {
         const call = this.active_calls.get(room);
         if (!call) {
           LogService.warn('PstnBridge', `Failed to process call hangup in ${room}: No known active call in room. Was the bridge restarted with active calls?`);
           return;
         }
-        const content = event.content as { call_id: string };
-        if (content.call_id !== call.matrix_id) {
-          LogService.warn('PstnBridge', `Received hangup for call ${content.call_id} in room ${room}, but only ${call.matrix_id} is known to be active in that room. Hanging up anyway.`);
+
+        const content = event.content as unknown;
+        if (!voip_ev.IVoipHangup.validate(content)) {
+          LogService.warn('PstnBridge', `Failed to process call answer in ${room}: Invalid event`);
+          return;
         }
-        // TODO: Is it even necessary to have a function in the module?
-        await mod.sendCallHangup(control_config.moddata, call);
+
+        if (content.version !== 0 && content.version !== 1) {
+          LogService.warn('PstnBridge', `Hangup in ${room} has unsupported version ${content.version}`);
+          return;
+        }
+        if (content.call_id !== call.matrix_id) {
+          LogService.debug('PstnBridge', `Ignoring hangup for other call ${content.call_id} in room ${room}`);
+          return;
+        }
+        // TODO: Is it even necessary to have a function in the module? Since
+        // changing the state fires an event, which the module can listen for
         call.state = CallState.HUNGUP;
+        await mod.sendCallHangup(control_config.moddata, call);
       } else {
         LogService.debug('PstnBridge', `Couldn't process event to ${remote_number} from ${room}. Unknown type ${event.type}`);
       }

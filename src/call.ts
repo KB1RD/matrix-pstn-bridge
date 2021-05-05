@@ -19,6 +19,7 @@ export type PhoneCallEventArgs = {
 };
 
 export class PhoneCall extends TypedEventEmitter<PhoneCallEvents> {
+  matrix_call_version = 0;
   private _state = CallState.CREATED;
   constructor(
     public readonly local: string,

@@ -104,6 +104,7 @@ export namespace IConfigData {
     required: ['bridge', 'database'],
   };
   ajv.addSchema(JSON);
+  export const validate = ajv.compile(JSON);
 };
 
 export function loadConfig(path: string): ICompleteConfig {

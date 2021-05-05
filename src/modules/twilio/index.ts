@@ -99,18 +99,6 @@ async function initCall(
         res();
       });
     }
-    sigstr.on('msg:candidate', (msg) => {
-      if (
-        typeof msg !== 'object' ||
-        typeof msg.candidate !== 'string' ||
-        typeof msg.label !== 'number' ||
-        msg.type !== 'candidate'
-      ) {
-        // TODO: log
-        return;
-      }
-      call.emit('send_candidates', [msg.sdp]);
-    });
     sigstr.on('msg:hangup', () => {
       call.emit('send_hangup');
       res();
@@ -336,33 +324,24 @@ const mod: IModule = {
       sigstr.send('invite', { sdp, callsid: '', preflight: false, twilio: {} });
     });
   },
-  async sendCallCandidates(
-    data: ITwilioData,
-    call: PhoneCall,
-    candidates_sdp: string[],
-  ): Promise<void> {
-    const cdata = calls.get(call);
-    if (!cdata) {
-      throw new Error('Call signalling not started with Twilio');
-    }
-    if (!cdata.twilio_id) {
-      throw new Error('Twilio remote not yet answered, no call ID');
-    }
-    candidates_sdp.forEach((candidate) => {
-      cdata.sigstr.send('candidate', {
-        callsid: cdata.twilio_id as string,
-        candidate,
-        label: 0, // TODO: fix
-        type: 'candidate',
-      });
-    });
+  async sendCallCandidates(): Promise<void> {
+    // It doesn't look like Twilio uses candidates.
+    // The connection is fairly simple: Browser client connects to Twilio
+    // Twilio doesn't send candidates and client candidates are kinda useless
   },
   async sendCallAccept(
     data: ITwilioData,
     call: PhoneCall,
     sdp: string,
   ): Promise<void> {
-    console.log('Twilio call accept');
+    const cdata = calls.get(call);
+    if (!cdata) {
+      throw new Error('Call signalling not started with Twilio');
+    }
+    if (!cdata.twilio_id) {
+      throw new Error('No remote ID. This should not happen.');
+    }
+    cdata.sigstr.send('answer', { callsid: cdata.twilio_id as string, sdp });
   },
   async sendCallHangup(): Promise<void> {
     // Call hangup handler is set up when the call is created

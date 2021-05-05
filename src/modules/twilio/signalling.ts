@@ -13,19 +13,11 @@ export interface IInvitePayload {
   twilio: object;
 }
 
-interface ICandidatePayload {
-  callsid: string;
-  candidate: string;
-  label: number;
-  type: 'candidate';
-}
-
 export interface ISendMsgFunc {
   (type: 'listen', payload: { token: string }): void;
   (type: 'register', payload: { media: { audio: true } }): void;
   (type: 'invite', payload: IInvitePayload): void;
   (type: 'answer', payload: { callsid: string, sdp: string }): void;
-  (type: 'candidate', payload: ICandidatePayload): void;
   (type: 'hangup', payload: { callsid: string }): void;
   (type: 'cancel', payload: { callsid: string }): void;
 }
@@ -104,6 +96,7 @@ export class TwilioSignallingStream extends EventEmitter {
     type: string,
     payload: object,
   ): void => {
+    console.log('SEND', type, payload);
     this.ws.send(
       JSON.stringify({ type, version: PSTREAM_VERSION, payload }),
     );
