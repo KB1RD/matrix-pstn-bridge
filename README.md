@@ -12,6 +12,7 @@ out.
 * Multi-provider module system enables easy use of other providers than
 Twilio (none yet implemented) and seamless switching between them.
 * Send SMS texts to phone numbers and receive texts back
+* Send and receive voice calls
 * Intelligent dialing looks up phone numbers based on the one you're using
 * Give SMS users "pet names"
 * Allow multiple users to puppet a bridge & allow the bridging of bots
@@ -22,18 +23,18 @@ Twilio (none yet implemented) and seamless switching between them.
   review conversation history.
 
 ## Planned Features
-* Displaying bridge info in Element settings
-* Dialer widget
-* Sending MMS (pictures, video, voice, etc.)
-* Getting extended information about users. Services like Twilio offer carrier
+* [ ] Displaying bridge info in Element settings
+* [ ] Dialer widget
+* [ ] Sending MMS (pictures, video, voice, etc.)
+* [ ] Getting extended information about users. Services like Twilio offer carrier
 lookups and that sort of thing. Could be useful to help weed out spam.
-* Phone calls -- This is very hard
-  * Answering machine
-* Faxing. Why not, I guess?
-* Pay-as-you-go managed phone number service
+* [x] Phone calls -- This is very hard
+  * [ ] Answering machine
+* [ ] Faxing. Why not, I guess?
+* [ ] Pay-as-you-go managed phone number service
   * Start a chat with the bridge bot and buy a phone number via Matrix
   * Payment security is an issue here ;)
-* Puppetting WhatsApp business or Facebook Messenger. Companies like Twilio
+* [ ] Puppetting WhatsApp business or Facebook Messenger. Companies like Twilio
 offer connections to proprietary messengers like these.
 
 ## Current Issues
