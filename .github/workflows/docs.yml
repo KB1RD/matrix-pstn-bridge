@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v2
 
-      - run: cd docs; bash build.sh; cd ..
+      - run: cd docs; bundle install; bash build.sh; cd ..
       
       - uses: JamesIves/github-pages-deploy-action@releases/v3
         with:
