@@ -9,6 +9,7 @@ import { loadConfig, createRegistration, loadRegTokens } from './config';
 import { Bridge } from './bridge';
 import { SqliteBridgeDatabase } from './database';
 import { BridgeHTTPServer } from './httpserver';
+import { log } from './log';
 
 const commandOptions = [
   { name: 'register', alias: 'r', type: Boolean },
@@ -44,6 +45,10 @@ const prefix = '_pstn_';
 
 // The logging level is already validated by Ajv
 LogService.setLevel(LogLevel[config.logging.level]);
+log.setLevel(config.logging.level);
+Object
+  .values(log.getLoggers())
+  .forEach((l) => l.setLevel(config.logging.level));
 
 const registration = createRegistration({
   prefix,

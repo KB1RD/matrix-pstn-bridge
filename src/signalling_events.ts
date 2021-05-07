@@ -3,6 +3,7 @@ import { JSONSchemaType } from 'ajv';
 
 export interface IVoipEvent {
   call_id: string;
+  party_id?: string;
   version: number;
 }
 export namespace IVoipEvent {
@@ -11,9 +12,11 @@ export namespace IVoipEvent {
     type: 'object',
     properties: {
       call_id: { type: 'string' },
+      party_id: { type: 'string', nullable: true },
       version: { type: 'number' },
     },
     required: ['call_id', 'version'],
+    anyOf: [{ properties: { version: { const: 1 } }, required: ['party_id'] }],
   };
   ajv.addSchema(JSON);
 };
@@ -31,6 +34,7 @@ export namespace IVoipInvite {
     type: 'object',
     properties: {
       call_id: { type: 'string' },
+      party_id: { type: 'string', nullable: true },
       version: { type: 'number' },
       lifetime: { type: 'number' },
       offer: {
@@ -43,6 +47,7 @@ export namespace IVoipInvite {
       },
     },
     required: ['call_id', 'version', 'lifetime', 'offer'],
+    anyOf: [{ properties: { version: { const: 1 } }, required: ['party_id'] }],
   };
   ajv.addSchema(JSON);
   export const validate = ajv.compile(JSON);
@@ -61,6 +66,7 @@ export namespace IVoipCandidates {
     type: 'object',
     properties: {
       call_id: { type: 'string' },
+      party_id: { type: 'string', nullable: true },
       version: { type: 'number' },
       candidates: {
         type: 'array',
@@ -76,6 +82,7 @@ export namespace IVoipCandidates {
       }
     },
     required: ['call_id', 'version', 'candidates'],
+    anyOf: [{ properties: { version: { const: 1 } }, required: ['party_id'] }],
   };
   ajv.addSchema(JSON);
   export const validate = ajv.compile(JSON);
@@ -93,6 +100,7 @@ export namespace IVoipAnswer {
     type: 'object',
     properties: {
       call_id: { type: 'string' },
+      party_id: { type: 'string', nullable: true },
       version: { type: 'number' },
       answer: {
         type: 'object',
@@ -104,6 +112,7 @@ export namespace IVoipAnswer {
       },
     },
     required: ['call_id', 'version', 'answer'],
+    anyOf: [{ properties: { version: { const: 1 } }, required: ['party_id'] }],
   };
   ajv.addSchema(JSON);
   export const validate = ajv.compile(JSON);
@@ -116,6 +125,25 @@ export namespace IVoipHangup {
     IVoipEvent.JSON,
     { $id: 'src/signalling_events.ts/IVoipHangup' },
   );
+  ajv.addSchema(JSON);
+  export const validate = ajv.compile(JSON);
+};
+
+export interface IVoipReject extends IVoipEvent {
+  version: 1;
+  party_id: string;
+}
+export namespace IVoipReject {
+  export const JSON: JSONSchemaType<IVoipReject> = {
+    $id: 'src/signalling_events.ts/IVoipReject',
+    type: 'object',
+    properties: {
+      call_id: { type: 'string' },
+      party_id: { type: 'string' },
+      version: { type: 'number', const: 1 },
+    },
+    required: ['call_id', 'version', 'party_id'],
+  };
   ajv.addSchema(JSON);
   export const validate = ajv.compile(JSON);
 };

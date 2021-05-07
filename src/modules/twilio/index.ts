@@ -8,6 +8,7 @@ import {
   PhoneCall,
   express,
   IWebhookHandlers,
+  getLogger,
 } from '../module';
 
 import { createSignallingStream, TwilioSignallingStream } from './signalling';
@@ -31,6 +32,8 @@ interface ICallData {
 const calls = new WeakMap<PhoneCall, ICallData>();
 const calls_by_id = new Map<string, ICallData>();
 
+const log = getLogger('twilio');
+
 async function initCall(
   data: ITwilioData,
   call: PhoneCall,
@@ -49,6 +52,7 @@ async function initCall(
   calls.set(call, cdata);
 
   call.on('ended', () => {
+    log.debug('Call ended, sending hangup');
     if (cdata.twilio_id) {
       calls_by_id.delete(cdata.twilio_id);
       sigstr.send('hangup', { callsid: cdata.twilio_id });
@@ -66,6 +70,7 @@ async function initCall(
     // answer or hangup. Setting the call SID on the invite does nothing.
     if (invite) {
       sigstr.on('msg:invite', (msg) => {
+        log.debug('Got invite message from Twilio');
         if (
           typeof msg !== 'object' ||
           typeof msg.sdp !== 'string' ||
@@ -83,6 +88,7 @@ async function initCall(
       });
     } else {
       sigstr.on('msg:answer', (msg) => {
+        log.debug('Got answer message from Twilio');
         if (
           typeof msg !== 'object' ||
           typeof msg.sdp !== 'string' ||
@@ -100,10 +106,12 @@ async function initCall(
       });
     }
     sigstr.on('msg:hangup', () => {
+      log.debug('Got hangup message from Twilio');
       call.emit('send_hangup');
       res();
     });
     sigstr.on('msg:cancel', () => {
+      log.debug('Got cancel message from Twilio');
       call.emit('send_hangup');
       res();
     });
@@ -200,13 +208,14 @@ const mod: IModule = {
     });
 
     app.post('/message', (req, res) => {
+      log.debug('Got incoming message request');
       res.sendStatus(204);
 
       if (
         typeof req.body.From !== 'string' ||
         typeof req.body.Body !== 'string'
       ) {
-        // TODO: Log
+        log.warn('Got corrupt msg request from Twilio. No From or Body.');
         return;
       }
       handlers.sendText(
@@ -218,7 +227,9 @@ const mod: IModule = {
     });
 
     app.post('/call/incoming', async (req, res) => {
+      log.debug('Got incoming call request');
       const fail = () => {
+        log.debug('Sending text-to-speech error response.');
         res.set('Content-Type', 'text/xml');
         res.send(`
           <Response>
@@ -231,7 +242,7 @@ const mod: IModule = {
         typeof req.body.From !== 'string' ||
         typeof req.body.CallSid !== 'string'
       ) {
-        // TODO: Log
+        log.warn('Got corrupt call request from Twilio. No From or CallSid.');
         fail();
         return;
       }
@@ -240,7 +251,7 @@ const mod: IModule = {
         req.control_room as string,
       )) as ITwilioData;
       if (!config) {
-        // TODO: Log
+        log.error('Got call for room with no config.');
         fail();
         return;
       }
@@ -255,6 +266,7 @@ const mod: IModule = {
         return;
       }
       await initCall(config, call, true, (sigstr, id) => {
+        log.debug('Responding with client dial TwiML...');
         const timeout = 60;
         // Including `<?xml version="1.0" encoding="UTF-8"?>` causes it to fail,
         // even though Twilio demos include it.
@@ -273,6 +285,7 @@ const mod: IModule = {
     });
 
     app.post('/call/outgoing', async (req, res) => {
+      log.debug('Got outgoing call request');
       const data = calls_by_id.get(req.body.CallSid);
       if (!data) {
         res.set('Content-Type', 'text/xml');
@@ -282,7 +295,9 @@ const mod: IModule = {
             <Speak>Internal error. Failed to find call</Speak>
           </Response>
         `);
-        // TODO: Log
+        log.error(
+          'Failed to find an active call with outgoing call request. This should not happen.'
+        );
         return;
       }
 
@@ -319,7 +334,9 @@ const mod: IModule = {
     call: PhoneCall,
     sdp: string
   ): Promise<void> {
+    log.debug('Initializing new call');
     await initCall(data, call, false, (sigstr) => {
+      log.debug('Sending invite to Twilio');
       // The call SID here doesn't seem to be used anywhere again
       sigstr.send('invite', { sdp, callsid: '', preflight: false, twilio: {} });
     });

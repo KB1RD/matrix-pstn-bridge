@@ -24,6 +24,7 @@ export class PhoneCall extends TypedEventEmitter<PhoneCallEvents> {
   constructor(
     public readonly local: string,
     public readonly remote: string,
+    public readonly from_matrix: boolean,
     public readonly matrix_id = Str.random(64)
   ) {
     super();
@@ -54,4 +55,19 @@ export class PhoneCall extends TypedEventEmitter<PhoneCallEvents> {
     this._state = state;
     this.emit('statechange', state, oldstate);
   }
+  get can_invite(): boolean {
+    return this.state === CallState.CREATED;
+  }
+  get can_answer(): boolean {
+    return this.state === CallState.INVITED;
+  }
+  get can_send_candidates(): boolean {
+    return this.state >= CallState.INVITED && this.state < CallState.FAILED;
+  }
+  get can_reject(): boolean {
+    // > This rejects the call on all devices, but if the calling device sees
+    // an accept, it disregards the reject event and carries on.`
+    return this.state < CallState.ACCEPTED;
+  }
+  // No point in asking if the call can be hung up; The answer is yes
 }

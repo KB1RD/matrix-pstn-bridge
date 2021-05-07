@@ -26,7 +26,6 @@ export class BridgeHTTPServer {
       const room = await db.getControlRoomFromWebhookToken(token);
 
       if (!room) {
-        console.log(room, token);
         res.sendStatus(403);
         return;
       }

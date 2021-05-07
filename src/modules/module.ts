@@ -2,6 +2,10 @@ import * as express from 'express';
 
 import { PhoneCall, PhoneCallEventArgs } from '../call';
 
+import * as log from '../log';
+
+export { PhoneCall, express };
+
 export interface ILinkOpts {
   webhook: string;
 };
@@ -15,7 +19,9 @@ export interface IWebhookHandlers {
   getConfig(control: string): Promise<object | null>;
 }
 
-export { PhoneCall, express };
+export function getLogger(name: string) {
+  return log.getLogger(`module/${name}`);
+}
 
 export interface IModule {
   friendly_name: string;

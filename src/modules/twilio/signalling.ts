@@ -2,6 +2,8 @@ import * as Twilio from 'twilio';
 import * as WS from 'ws';
 import * as EventEmitter from 'events';
 
+import { getLogger } from '../module';
+
 const AccessToken = Twilio.jwt.AccessToken;
 const VoiceGrant = AccessToken.VoiceGrant;
 
@@ -22,6 +24,8 @@ export interface ISendMsgFunc {
   (type: 'cancel', payload: { callsid: string }): void;
 }
 
+const log = getLogger('twilio/sigstr');
+
 export const PSTREAM_VERSION = '1.5';
 /**
  * A stream to interact with Twilio's client SDK VoIP signalling.
@@ -30,13 +34,11 @@ export const PSTREAM_VERSION = '1.5';
  */
 export class TwilioSignallingStream extends EventEmitter {
   protected _ws?: WS
-  test = new Set<(arg: string) => void>();
   constructor(
     protected readonly token: string,
     protected readonly url = 'wss://chunderw-vpc-gll.twilio.com/signal',
   ) {
     super();
-    this.on('msg', console.log);
   }
   
   get ws(): WS {
@@ -51,8 +53,8 @@ export class TwilioSignallingStream extends EventEmitter {
 
     const promise = new Promise((r) => (this.ws.onopen = r));
     this._ws.onmessage = this._ws_message.bind(this);
-    this._ws.onclose = () => console.log('WS closed');
-    this._ws.onerror = (e) => console.log('WS error', e);
+    this._ws.onclose = () => log.debug('Stream closed');
+    this._ws.onerror = (e) => log.warn('Stream websocket error', e);
 
     await promise;
     this.send('listen', { token: this.token });
@@ -74,20 +76,26 @@ export class TwilioSignallingStream extends EventEmitter {
     // Keep alive
     if (e.data.trim() === '') {
       this.ws.send('\n');
+      log.debug('Responding to Twilio WS keepalive');
+      return;
     }
 
     let d;
     try {
       d = JSON.parse(e.data);
     } catch {
-      // TODO: Log maybe?
+      log.warn(
+        'Got invalid message from Twilio, unable to parse:',
+        // The stringify here renders with quotes so the exact text is known
+        JSON.stringify(e.data),
+      );
       return;
     }
-    console.log(d);
     if (typeof d.type !== 'string' || typeof d.payload !== 'object') {
-      // TODO: Log maybe?
+      log.warn('Got invalid message from Twilio:', d);
       return;
     }
+    log.debug('Got msg:', d);
     this.emit(`msg`, d.type, d.payload);
     this.emit(`msg:${d.type}`, d.payload);
   }
@@ -96,10 +104,10 @@ export class TwilioSignallingStream extends EventEmitter {
     type: string,
     payload: object,
   ): void => {
-    console.log('SEND', type, payload);
     this.ws.send(
       JSON.stringify({ type, version: PSTREAM_VERSION, payload }),
     );
+    log.debug(`Sent msg '${type}':`, payload);
   }
 }
 

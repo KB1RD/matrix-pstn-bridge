@@ -3,7 +3,6 @@ import {
   IAppserviceOptions,
   MessageEvent,
   Intent,
-  LogService,
   RoomEvent,
   MessageEventContent,
 } from 'matrix-bot-sdk';
@@ -17,6 +16,8 @@ import { BridgeHTTPServer } from './httpserver';
 import { PhoneCall } from './modules/module';
 import { CallState } from './call';
 import * as voip_ev from './signalling_events';
+import { getLogger } from './log'
+import { TupleLookup } from './util';
 
 export interface IUserInfo {
   displayname: string
@@ -29,12 +30,17 @@ export interface IBridgeOptions extends IAppserviceOptions {
   config: ICompleteConfig;
 };
 
+const log = getLogger('bridge');
+
 export class Bridge extends Appservice {
   // TODO: Make config option.
   protected readonly bot_name = 'PSTN Bridge Bot';
 
-  // Room name <-> call
-  protected readonly active_calls = new Map<string, PhoneCall>();
+  // Room name, call ID <-> call
+  protected readonly active_calls = new TupleLookup<
+    [string, string],
+    PhoneCall
+  >();
 
   constructor(protected readonly opts: IBridgeOptions) {
     // `options` is private in `Appservice`. We define it *again* as protected,
@@ -60,7 +66,7 @@ export class Bridge extends Appservice {
 
     // Respond to invites
     this.on('room.invite', async (room, { sender, state_key }) => {
-      LogService.info('PstnBridge', `Got invite for ${state_key} to ${room}`);
+      log.info(`Got invite for ${state_key} to ${room}`);
 
       // Ignore invites for anything but the bot
       if (
@@ -68,27 +74,34 @@ export class Bridge extends Appservice {
         state_key === this.botUserId &&
         getUserAction(this.opts.config, sender) === 'FULL'
       ) {
-        LogService.info('PstnBridge', `Accepting invite to ${room}`);
+        log.info(`Accepting invite to ${room}`);
         try {
           await this.botIntent.joinRoom(room);
         } catch (e) {
-          LogService.error('PstnBridge', `Failed to accept invite to ${room}: ${e}`);
+          log.error(`Failed to accept invite to ${room}: ${e}`);
         }
         return;
       }
 
-      LogService.info('PstnBridge', `Rejecting invite to ${room}`);
+      log.info(`Rejecting invite to ${room}`);
       try {
         await this.getIntentForUserId(state_key).leaveRoom(room);
       } catch (e) {
-        LogService.error('PstnBridge', `Failed to reject invite to ${room}: ${e}`);
+        log.error(`Failed to reject invite to ${room}: ${e}`);
       }
     });
 
     const self = this;
     this.addPreprocessor({
       getSupportedEventTypes(): string[] {
-        return ['m.room.message', 'm.call.answer', 'm.call.invite', 'm.call.candidates', 'm.call.hangup'];
+        return [
+          'm.room.message',
+          'm.call.answer',
+          'm.call.invite',
+          'm.call.candidates',
+          'm.call.hangup',
+          'm.call.reject',
+        ];
       },
       async processEvent(e_raw: any): Promise<void> {
         const roomId = e_raw?.room_id;
@@ -100,17 +113,15 @@ export class Bridge extends Appservice {
         if (
           !event.sender ||
           !event.type ||
-          typeof self.getBridgeUserId(event.sender) === 'string'
+          self.isNamespacedUser(event.sender)
         ) {
+          log.debug(`Dropping local echo from ${event.sender}`);
           return;
         }
-        LogService.debug(
-          'PstnBridge',
-          `Got event of type '${event.type}' in room ${roomId}`,
-        );
+        log.debug(`Got event of type '${event.type}' in room ${roomId}`);
 
         if (getUserAction(self.opts.config, event.sender) === 'DENY') {
-          LogService.info('PstnBridge', `Denied message sending in ${roomId}`);
+          log.info(`Denied message sending in ${roomId}`);
           self.botClient.sendNotice(roomId, 'Access denied');
           return;
         }
@@ -124,13 +135,13 @@ export class Bridge extends Appservice {
             event.type === 'm.room.message' &&
             (msg = new MessageEvent(e_raw)).messageType === 'm.text'
           ) {
-            LogService.debug('PstnBridge', `Processing event as control message`);
+            log.debug(`Processing event as control message`);
             await self.processControlMessage(msg.textBody, roomId, msg.sender);
           }
           return;
         }
 
-        LogService.debug('PstnBridge', `Processing event as bridged message`);
+        log.debug(`Processing event as bridged message`);
         await self.processBridgedEvent(event, roomId, config);
       },
     });
@@ -187,12 +198,11 @@ export class Bridge extends Appservice {
             throw new Error('No registered number in room');
           }
 
-          const call = new PhoneCall(cfg.number, from, Str.random(64));
+          const call = new PhoneCall(cfg.number, from, false, Str.random(64));
           self.addNewCall(info.room, call);
           return call;
         } catch (e) {
-          LogService.info(
-            `PstnBridge`,
+          log.info(
             `Failed to create phone call from ${from} to user under control room ${control}.`
           );
           return null;
@@ -207,8 +217,7 @@ export class Bridge extends Appservice {
           const info = await self.getPhoneNumRoom(control, from);
           info.intent.sendText(info.room, body);
         } catch (e) {
-          LogService.info(
-            `PstnBridge`,
+          log.info(
             `Failed to send text from ${from} to user under control room ${control}.`
           );
         }
@@ -250,14 +259,12 @@ export class Bridge extends Appservice {
 
   addNewCall(room: string, call: PhoneCall): boolean {
     // TODO glare
-    this.active_calls.set(room, call);
+    this.active_calls.set([room, call.matrix_id], call);
+    const call_log = getLogger(`bridge/call/${room}/${call.matrix_id}`);
     call.on('ended', () => {
-      if (this.active_calls.get(room) === call) {
-        LogService.info(
-          `PstnBridge CALL/${room}/${call.matrix_id}`,
-          `Call was hung up or failed. Call will be deleted.`
-        );
-        this.active_calls.delete(room);
+      if (this.active_calls.get([room, call.matrix_id]) === call) {
+        call_log.info('Call was hung up or failed. Call will be deleted.');
+        this.active_calls.delete([room, call.matrix_id]);
       }
     });
 
@@ -272,13 +279,13 @@ export class Bridge extends Appservice {
           // TODO: What should this be?
           lifetime: 60000,
           offer: { sdp, type: 'offer' },
-          version: 0,
+          version: call.matrix_call_version,
+          // I can get away with the party ID being the same since there's only
+          // one remote "device"
+          party_id: call.matrix_call_version === 1 ? '' : undefined,
         });
       } catch (e) {
-        LogService.error(
-          `PstnBridge CALL/${room}/${call.matrix_id}`,
-          `Error sending invite: ${e}`
-        );
+        call_log.error(`Error sending invite: ${e}`);
       }
     });
     call.on('send_candidates', async (candidates_sdp: string[]) => {
@@ -291,13 +298,11 @@ export class Bridge extends Appservice {
             sdpMLineIndex: 0,
             sdpMid: 'audio',
           })),
-          version: 0,
+          version: call.matrix_call_version,
+          party_id: call.matrix_call_version === 1 ? '' : undefined,
         });
       } catch (e) {
-        LogService.error(
-          `PstnBridge CALL/${room}/${call.matrix_id}`,
-          `Error sending candidates: ${e}`
-        );
+        call_log.error(`Error sending candidates: ${e}`);
       }
     });
     call.on('send_accept', async (sdp: string) => {
@@ -307,26 +312,22 @@ export class Bridge extends Appservice {
           // TODO: What should this be?
           lifetime: 60000,
           answer: { sdp, type: 'answer' },
-          version: 0,
+          version: call.matrix_call_version,
+          party_id: call.matrix_call_version === 1 ? '' : undefined,
         });
       } catch (e) {
-        LogService.error(
-          `PstnBridge CALL/${room}/${call.matrix_id}`,
-          `Error sending answer: ${e}`
-        );
+        call_log.error(`Error sending answer: ${e}`);
       }
     });
     call.on('send_hangup', async () => {
       try {
         await sendEvent('m.call.hangup', {
           call_id: call.matrix_id,
-          version: 0,
+          version: call.matrix_call_version,
+          party_id: call.matrix_call_version === 1 ? '' : undefined,
         });
       } catch (e) {
-        LogService.error(
-          `PstnBridge CALL/${room}/${call.matrix_id}`,
-          `Error sending hangup: ${e}`
-        );
+        call_log.error(`Error sending hangup: ${e}`);
       }
     });
     return true;
@@ -363,7 +364,7 @@ export class Bridge extends Appservice {
           try {
             stat = await mod.getStatusMsg(config.moddata);
           } catch (e) {
-            LogService.warn('PstnBridge', `Failed to update status on ${room} for ${config.module}`);
+            log.warn(`Failed to update status on ${room} for ${config.module}`);
           }
           replies.push(`Linked to ${config.number} via ${mod.friendly_name}. ${stat}`);
         }
@@ -399,9 +400,9 @@ export class Bridge extends Appservice {
           room,
           { module: modname as string, number, moddata }
         );
-        LogService.debug('PstnBridge', `Linked ${room} to ${number} via ${modname}`);
+        log.debug(`Linked ${room} to ${number} via ${modname}`);
       } catch (e) {
-        LogService.warn('PstnBridge', `Failed to link module ${modname}: ${e}`);
+        log.warn(`Failed to link module ${modname}: ${e}`);
         replies.push(`Error linking to ${modname}: ${e.message}`);
         return;
       }
@@ -415,7 +416,7 @@ export class Bridge extends Appservice {
       this.db.setControlRoomConfig(room, null);
       this.db.deleteWebhookToken(room);
       replies.push(`Account unlinked`);
-      LogService.debug('PstnBridge', `Unlinked ${room}`);
+      log.debug(`Unlinked ${room}`);
     },
 
     async dial(
@@ -468,14 +469,14 @@ export class Bridge extends Appservice {
         this.getTelSuffix(num.E164),
         name,
       );
-      LogService.debug('PstnBridge', `Updating name in ${room} for ${num}`);
+      log.debug(`Updating name in ${room} for ${num}`);
     },
   };
   async processControlMessage(text: string, room: string, sender: string): Promise<void> {
     let replies: string[] = [];
     const args = text.trim().split(' ').map((a) => a.trim()).filter((a) => a);
 
-    LogService.debug('PstnBridge', `Got command ${args[0]} in ${room}`);
+    log.debug(`Got command ${args[0]} in ${room}`);
     
     let func = this.commands[args[0]];
     if (!func) {
@@ -486,7 +487,7 @@ export class Bridge extends Appservice {
       await func.call(this, { room, sender, replies }, ...args.slice(1));
     } catch (e) {
       replies.push(`Internal error processing command`);
-      LogService.error('PstnBridge', `Got error when processing ${args[0]} in ${room}: ${e}`);
+      log.error(`Got error when processing ${args[0]} in ${room}: ${e}`);
     }
 
     if (replies.length) {
@@ -506,7 +507,7 @@ export class Bridge extends Appservice {
     }
 
     if (!control_config) {
-      LogService.debug('PstnBridge', `Got bridge message in unlinked room ${room}.`);
+      log.debug(`Got bridge message in unlinked room ${room}.`);
       intent.sendText(
         room,
         'This bridge is not linked. Please use the link command in the bridge control room',
@@ -517,7 +518,7 @@ export class Bridge extends Appservice {
 
     const mod = this.getModule(control_config.module);
     if (!mod) {
-      LogService.debug('PstnBridge', `Got bridge message in room ${room} with unregistered module ${control_config.module}`);
+      log.debug(`Got bridge message in room ${room} with unregistered module ${control_config.module}`);
       intent.sendText(
         room,
         `The '${control_config.module}' module was removed since this bridge was linked. Cannot send`,
@@ -531,7 +532,7 @@ export class Bridge extends Appservice {
         const msg = new MessageEvent(event.raw);
         switch (msg.messageType) {
           case 'm.text':
-            LogService.debug('PstnBridge', `Sending message to ${remote_number} from ${room}`);
+            log.debug(`Sending message to ${remote_number} from ${room}`);
             await mod.sendMessage(
               control_config.moddata,
               control_config.number,
@@ -541,21 +542,32 @@ export class Bridge extends Appservice {
             break;
         }
       } else if (event.type === 'm.call.invite') {
-        LogService.debug('PstnBridge', `Creating call to ${remote_number} in ${room}`);
+        log.debug(`Creating call to ${remote_number} in ${room}`);
         const content = event.content as unknown;
         if (!voip_ev.IVoipInvite.validate(content)) {
-          LogService.warn('PstnBridge', `Failed to process call invite in ${room}: Invalid event`);
+          log.warn(`Failed to process call invite in ${room}: Invalid event`);
           return;
         }
 
         if (content.version !== 0 && content.version !== 1) {
-          LogService.warn('PstnBridge', `Invite in ${room} has unsupported version ${content.version}`);
+          log.warn(`VoIP invite in ${room} has unsupported version ${content.version}`);
+          return;
+        }
+
+        if (new Date().getTime() > event.timestamp + content.lifetime) {
+          log.info(`Invite in ${room} past expiration`);
+          return;
+        }
+
+        if (this.active_calls.has([room, content.call_id])) {
+          log.warn(`Failed to process call invite in ${room}: Call already active with same ID`);
           return;
         }
 
         const call = new PhoneCall(
           control_config.number,
           remote_number,
+          true,
           content.call_id
         );
         call.matrix_call_version = content.version;
@@ -567,24 +579,23 @@ export class Bridge extends Appservice {
           content.offer.sdp,
         );
       } else if (event.type === 'm.call.candidates') {
-        const call = this.active_calls.get(room);
-        if (!call) {
-          LogService.warn('PstnBridge', `Failed to process call candidates in ${room}: No known active call in room. Was the bridge restarted with active calls?`);
-          return;
-        }
-
         const content = event.content as unknown;
         if (!voip_ev.IVoipCandidates.validate(content)) {
-          LogService.warn('PstnBridge', `Failed to process call candidates in ${room}: Invalid event`);
+          log.warn(`Failed to process call candidates in ${room}: Invalid event`);
           return;
         }
 
         if (content.version !== 0 && content.version !== 1) {
-          LogService.warn('PstnBridge', `Candidates event in ${room} has unsupported version ${content.version}`);
+          log.warn(`Candidates event in ${room} has unsupported version ${content.version}`);
           return;
         }
-        if (content.call_id !== call.matrix_id) {
-          LogService.debug('PstnBridge', `Ignoring candidates event for other call ${content.call_id} in room ${room}`);
+        const call = this.active_calls.get([room, content.call_id]);
+        if (!call) {
+          log.warn(`Failed to process call candidates in ${room} for call ${content.call_id}: Not tracking this call. Was the bridge restarted with active calls?`);
+          return;
+        }
+        if (!call.can_send_candidates) {
+          log.warn(`Failed to process call candidates in ${room} for all ${content.call_id}: Call not in state where candidates can be sent`);
           return;
         }
 
@@ -594,24 +605,23 @@ export class Bridge extends Appservice {
           content.candidates.map(({ candidate }) => candidate),
         );
       } else if (event.type === 'm.call.answer') {
-        const call = this.active_calls.get(room);
-        if (!call) {
-          LogService.warn('PstnBridge', `Failed to process call answer in ${room}: No known active call in room. Was the bridge restarted with active calls?`);
-          return;
-        }
-
         const content = event.content as unknown;
         if (!voip_ev.IVoipAnswer.validate(content)) {
-          LogService.warn('PstnBridge', `Failed to process call answer in ${room}: Invalid event`);
+          log.warn(`Failed to process call answer in ${room}: Invalid event`);
           return;
         }
 
         if (content.version !== 0 && content.version !== 1) {
-          LogService.warn('PstnBridge', `Answer in ${room} has unsupported version ${content.version}`);
+          log.warn(`Answer in ${room} has unsupported version ${content.version}`);
           return;
         }
-        if (content.call_id !== call.matrix_id) {
-          LogService.debug('PstnBridge', `Ignoring answer for other call ${content.call_id} in room ${room}`);
+        const call = this.active_calls.get([room, content.call_id]);
+        if (!call) {
+          log.warn(`Failed to process call answer in ${room} for call ${content.call_id}: Not tracking this call. Was the bridge restarted with active calls?`);
+          return;
+        }
+        if (!call.can_answer) {
+          log.warn(`Failed to process call answer in ${room} for all ${content.call_id}: Call not in state where answer can be sent`);
           return;
         }
 
@@ -622,35 +632,54 @@ export class Bridge extends Appservice {
           content.answer.sdp,
         );
       } else if (event.type === 'm.call.hangup') {
-        const call = this.active_calls.get(room);
-        if (!call) {
-          LogService.warn('PstnBridge', `Failed to process call hangup in ${room}: No known active call in room. Was the bridge restarted with active calls?`);
-          return;
-        }
-
         const content = event.content as unknown;
         if (!voip_ev.IVoipHangup.validate(content)) {
-          LogService.warn('PstnBridge', `Failed to process call answer in ${room}: Invalid event`);
+          log.warn(`Failed to process call answer in ${room}: Invalid event`);
           return;
         }
 
         if (content.version !== 0 && content.version !== 1) {
-          LogService.warn('PstnBridge', `Hangup in ${room} has unsupported version ${content.version}`);
+          log.warn(`Hangup in ${room} has unsupported version ${content.version}`);
           return;
         }
-        if (content.call_id !== call.matrix_id) {
-          LogService.debug('PstnBridge', `Ignoring hangup for other call ${content.call_id} in room ${room}`);
+        const call = this.active_calls.get([room, content.call_id]);
+        if (!call) {
+          log.warn(`Failed to process call hangup in ${room} for call ${content.call_id}: Not tracking this call. Was the bridge restarted with active calls?`);
           return;
         }
+
         // TODO: Is it even necessary to have a function in the module? Since
         // changing the state fires an event, which the module can listen for
         call.state = CallState.HUNGUP;
         await mod.sendCallHangup(control_config.moddata, call);
+      } else if (event.type === 'm.call.reject') {
+        const content = event.content as unknown;
+        if (!voip_ev.IVoipHangup.validate(content)) {
+          log.warn(`Failed to process call reject in ${room}: Invalid event`);
+          return;
+        }
+
+        if (content.version !== 0 && content.version !== 1) {
+          log.warn(`Reject in ${room} has unsupported version ${content.version}`);
+          return;
+        }
+        const call = this.active_calls.get([room, content.call_id]);
+        if (!call) {
+          log.warn(`Failed to process call reject in ${room} for call ${content.call_id}: Not tracking this call. Was the bridge restarted with active calls?`);
+          return;
+        }
+        if (!call.can_reject) {
+          log.warn(`Failed to process call reject in ${room} for all ${content.call_id}: Call not in state where reject can be sent`);
+          return;
+        }
+
+        call.state = CallState.HUNGUP;
+        await mod.sendCallHangup(control_config.moddata, call);
       } else {
-        LogService.debug('PstnBridge', `Couldn't process event to ${remote_number} from ${room}. Unknown type ${event.type}`);
+        log.debug(`Couldn't process event to ${remote_number} from ${room}. Unknown type ${event.type}`);
       }
     } catch(e) {
-      LogService.error('PstnBridge', `Failed to send event of type ${event.type} to ${remote_number} from ${room}: ${e}`);
+      log.error(`Failed to send event of type ${event.type} to ${remote_number} from ${room}: ${e}`);
       intent.sendText(
         room,
         `Failed to forward event: ${e.message}`,
@@ -703,7 +732,7 @@ export class Bridge extends Appservice {
     }
 
     if (cstate?.membership === 'join' && cstate?.displayname !== name) {
-      LogService.debug('PstnBridge', `Updating display name in room ${room} for ${suffix}.`);
+      log.debug(`Updating display name in room ${room} for ${suffix}.`);
       await client.sendStateEvent(
         room,
         'm.room.member',
@@ -755,21 +784,21 @@ export class Bridge extends Appservice {
     if (typeof room === 'string' && (await intent.getJoinedRooms()).includes(room)) {
       await reconcileRoomState();
       if (user && !(await client.getJoinedRoomMembers(room)).includes(user)) {
-        LogService.debug('PstnBridge', `Invited user ${user} to ${room}.`);
+        log.debug(`Invited user ${user} to ${room}.`);
         await intent.underlyingClient.inviteUser(user, room);
         return { room, changed: true, intent };
       }
-      LogService.debug('PstnBridge', `Room ${room} already exists. Taking no action.`);
+      log.debug(`Room ${room} already exists. Taking no action.`);
       return { room, changed: false, intent };
     }
 
     // TODO: Sync membership
     const membership = (await this.botClient.getRoomMembers(control, undefined, ['join']))
       .map(({ membershipFor }) => membershipFor)
-      .filter((m) => typeof this.getBridgeUserId(m) !== 'string');
+      .filter((m) => typeof this.getSuffixForUserId(m) !== 'string');
 
     await intent.ensureRegistered();
-    LogService.debug('PstnBridge', `Creating new room for ${control} to bridge to ${e164}.`);
+    log.debug(`Creating new room for ${control} to bridge to ${e164}.`);
     room = await client.createRoom({
       preset: 'private_chat',
       visibility: 'private',
@@ -784,22 +813,5 @@ export class Bridge extends Appservice {
 
     await reconcileRoomState();
     return { room, changed: true, intent };
-  }
-  
-  getBridgeUserId(mxid: string): string | null {
-    if (!mxid.startsWith('@')) {
-      return null; // It's not even a MXID
-    }
-    const [localpart, ...rem] = mxid.slice(1).split(':');
-    if (rem.join(':') !== this.opts.homeserverName) {
-      return null; // Different server
-    }
-
-    // Check if its for this bridge
-    if (localpart.startsWith(this.opts.prefix)) {
-      // Get the part after the bridge prefix
-      return localpart.slice(this.opts.prefix.length);
-    }
-    return null;
   }
 }
