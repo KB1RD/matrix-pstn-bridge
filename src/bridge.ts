@@ -18,6 +18,7 @@ import { CallState } from './call';
 import * as voip_ev from './signalling_events';
 import { getLogger } from './log'
 import { TupleLookup } from './util';
+import { UserFriendlyError } from './error';
 
 export interface IUserInfo {
   displayname: string
@@ -402,8 +403,13 @@ export class Bridge extends Appservice {
         );
         log.debug(`Linked ${room} to ${number} via ${modname}`);
       } catch (e) {
-        log.warn(`Failed to link module ${modname}: ${e}`);
-        replies.push(`Error linking to ${modname}: ${e.message}`);
+        if (e instanceof UserFriendlyError) {
+          log.warn(`Failed to link module ${modname}: ${e}`);
+          replies.push(`Failed to link to ${modname}: ${e.message}`);
+        } else {
+          log.error(`Failed to link module ${modname}: ${e}`);
+          replies.push(`Unknown error linking to ${modname}`);
+        }
         return;
       }
 
@@ -413,6 +419,29 @@ export class Bridge extends Appservice {
       this: Bridge,
       { room, replies }: { room: string, sender: string, replies: string[] },
     ): Promise<void> {
+      const config = await this.db.getControlRoomConfig(room);
+      if (config) {
+        const mod = this.getModule(config.module);
+        if (!mod) {
+          replies.push(`Linked to ${config.number} via a module that has been removed. Unable to clean up registration. Unlinking anyway...`);
+        } else {
+          try {
+            await mod.unlink(config.moddata, config.number);
+          } catch (e) {
+            log.error(
+              `Failed to perform unlink cleanup with module ${config.module}: ${e}`
+            );
+            if (e instanceof UserFriendlyError) {
+              replies.push(`Failed to clean up registration: ${e.message}.`);
+            } else {
+              replies.push(`Unknown error cleaning up registration.`);
+            }
+          }
+        }
+      } else {
+        replies.push(`Bridge already unlinked`);
+        return;
+      }
       this.db.setControlRoomConfig(room, null);
       this.db.deleteWebhookToken(room);
       replies.push(`Account unlinked`);
@@ -680,11 +709,19 @@ export class Bridge extends Appservice {
       }
     } catch(e) {
       log.error(`Failed to send event of type ${event.type} to ${remote_number} from ${room}: ${e}`);
-      intent.sendText(
-        room,
-        `Failed to forward event: ${e.message}`,
-        'm.notice'
-      );
+      if (e instanceof UserFriendlyError) {
+        intent.sendText(
+          room,
+          `Failed to forward event: ${e.message}`,
+          'm.notice'
+        );
+      } else {
+        intent.sendText(
+          room,
+          `Unknown error forwarding event`,
+          'm.notice'
+        );
+      }
     }
   }
 

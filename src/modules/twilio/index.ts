@@ -14,6 +14,7 @@ import {
 import { createSignallingStream, TwilioSignallingStream } from './signalling';
 import { CallState } from '../../call';
 import * as concat from 'concat-stream';
+import { UserFriendlyError } from '../../error';
 
 interface ITwilioData {
   version: 0;
@@ -129,7 +130,7 @@ const mod: IModule = {
   ): Promise<[string, ITwilioData]> {
     const number = (numargs && numargs.length && numargs.join(' ')) || ''
     if (!sid || !authToken || number === '') {
-      throw new TypeError('Usage: link twilio [sid] [token] [number...]');
+      throw new UserFriendlyError('Usage: link twilio [sid] [token] [number...]');
     }
 
     // The whole account token is necessary for voice API grants
@@ -137,12 +138,12 @@ const mod: IModule = {
     // create a JWT token. So let's see... That's 3 ids and 2 secrets to create
     // another single use token. 6 identifiers. What the hell.
     if (!sid.startsWith('AC')) {
-      throw new TypeError('The SID must be your account SID (starts with AC)');
+      throw new UserFriendlyError('The SID must be your account SID (starts with AC)');
     }
 
     const e164 = phone.parsePhoneNumber(number)?.E164;
     if (!e164) {
-      throw new TypeError(`Invalid phone number ${number}`);
+      throw new UserFriendlyError(`Invalid phone number ${number}`);
     }
 
     const twilio = Twilio(sid, authToken);
@@ -155,7 +156,7 @@ const mod: IModule = {
       const { sid, secret } = await twilio.newKeys.create(opts);
       apikey = { sid, secret };
     } catch(e) {
-      throw new Error(
+      throw new UserFriendlyError(
         'Failed to create API key. Are the credentials correct?'
       );
     }
@@ -165,7 +166,7 @@ const mod: IModule = {
     try {
       appSid = (await twilio.applications.create(opts)).sid;
     } catch(e) {
-      throw new Error(
+      throw new UserFriendlyError(
         'Failed to create TwiML app. Are the credentials correct?'
       );
     }
@@ -175,7 +176,7 @@ const mod: IModule = {
         .incomingPhoneNumbers
         .list({ phoneNumber: e164 });
       if (numbers.length !== 1) {
-        throw new Error(`Failed to find the number (${e164}) in your account.`);
+        throw new UserFriendlyError(`Failed to find the number (${e164}) in your account.`);
       }
       numbers[0].smsMethod = 'POST';
       numbers[0].smsUrl = `${webhook}/message`;
@@ -183,11 +184,38 @@ const mod: IModule = {
       numbers[0].voiceUrl = `${webhook}/call/incoming`;
       await numbers[0].update(numbers[0]);
     } catch(e) {
-      throw new Error(
+      throw new UserFriendlyError(
         'Failed to confirm phone number. Are the credentials correct?'
       );
     }
     return [e164, { version: 0, sid, authToken, apikey, appSid }];
+  },
+  unlink(data: ITwilioData, phoneNumber: string): Promise<void> {
+    const twilio = Twilio(data.sid, data.authToken);
+    const funcs = [
+      async () => {
+        log.debug('Removing Twilio API key...');
+        await twilio.keys(data.apikey.sid).remove();
+      },
+      async () => {
+        log.debug('Removing Twilio application...');
+        await twilio.applications.get(data.appSid).remove();
+      },
+      async () => {
+        log.debug('Removing Twilio number webhooks...');
+        const numbers = await twilio.incomingPhoneNumbers.list({ phoneNumber });
+        if (numbers.length !== 1) {
+          log.warn('Failed to remove webhooks from number: No longer exists');
+          return; // Assume the user deleted it manually
+        }
+        numbers[0].smsMethod = 'POST';
+        numbers[0].smsUrl = ``;
+        numbers[0].voiceMethod = 'POST';
+        numbers[0].voiceUrl = ``;
+        await numbers[0].update(numbers[0]);
+      },
+    ];
+    return Promise.all(funcs.map((f) => f())) as unknown as Promise<void>;
   },
 
   registerWebhooks(app: express.Application, handlers: IWebhookHandlers) {
@@ -353,10 +381,10 @@ const mod: IModule = {
   ): Promise<void> {
     const cdata = calls.get(call);
     if (!cdata) {
-      throw new Error('Call signalling not started with Twilio');
+      throw new UserFriendlyError('Call signalling not started with Twilio');
     }
     if (!cdata.twilio_id) {
-      throw new Error('No remote ID. This should not happen.');
+      throw new UserFriendlyError('No remote ID. This should not happen.');
     }
     cdata.sigstr.send('answer', { callsid: cdata.twilio_id as string, sdp });
   },

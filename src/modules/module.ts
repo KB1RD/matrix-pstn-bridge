@@ -27,6 +27,7 @@ export interface IModule {
   friendly_name: string;
 
   tryLink(opts: ILinkOpts, ...args: string[]): Promise<[string, any]>;
+  unlink(data: object, number: string): Promise<void>;
   getStatusMsg(data: object): Promise<string>;
 
   registerWebhooks(app: express.Application, handlers: IWebhookHandlers): void;
