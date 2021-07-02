@@ -200,7 +200,15 @@ export class Bridge extends Appservice {
           }
 
           const call = new PhoneCall(cfg.number, from, false, Str.random(64));
-          self.addNewCall(info.room, call);
+          if (info.notE164) {
+            await self.botIntent.sendText(
+              control,
+              `Got phone call from invalid number '${from}', cannot process`,
+            );
+            return null;
+          } else {
+            self.addNewCall(info.room, call);
+          }
           return call;
         } catch (e) {
           log.info(
@@ -216,10 +224,17 @@ export class Bridge extends Appservice {
       ): Promise<void> {
         try {
           const info = await self.getPhoneNumRoom(control, from);
-          info.intent.sendText(info.room, body);
+          if (info.notE164) {
+            self.botIntent.sendText(
+              control,
+              `Got text from invalid number '${from}': ${body}`,
+            );
+          } else {
+            info.intent.sendText(info.room, body);
+          }
         } catch (e) {
           log.info(
-            `Failed to send text from ${from} to user under control room ${control}.`
+            `Failed to send text from ${from} to user under control room ${control}: ${e}`
           );
         }
       },
@@ -258,7 +273,11 @@ export class Bridge extends Appservice {
     return null;
   }
 
-  addNewCall(room: string, call: PhoneCall): boolean {
+  addNewCall(
+    room: string,
+    call: PhoneCall,
+    intent = this.getIntentForSuffix(this.getTelSuffix(call.remote))
+  ): boolean {
     // TODO glare
     this.active_calls.set([room, call.matrix_id], call);
     const call_log = getLogger(`bridge/call/${room}/${call.matrix_id}`);
@@ -270,7 +289,6 @@ export class Bridge extends Appservice {
     });
 
     const sendEvent = async (type: string, event: object): Promise<void> => {
-      const intent = this.getIntentForSuffix(this.getTelSuffix(call.remote));
       intent.underlyingClient.sendEvent(room, type, event);
     }
     call.on('send_invite', async (sdp: string) => {
@@ -461,6 +479,10 @@ export class Bridge extends Appservice {
       }
       
       const info = await this.getPhoneNumRoom(room, num.E164, sender);
+      if (info.notE164) {
+        log.error('E164 number is not valid E164. This should not happen.');
+        return;
+      }
       if (!info.changed) {
         replies.push(`Bridge already open under ${info.room}.`);
       }
@@ -792,16 +814,23 @@ export class Bridge extends Appservice {
    * @param control - The control room ID
    * @param e164 - The E164 number for the remote number
    * @param user - An optional user to ensure is in the room
-   * @returns An object: `{ room: string, changed: boolean, intent: Intent }`
+   * @returns An object:
+   * `{ room: string, changed: boolean, notE164: false, intent: Intent }`
    * `room` contains the ID of the new/old room, `changed` is set to true if
    * some change to server state has been made (create or invite), and `intent`
    * is the bot SDK's intent for the phone number.
+   * OR `{ notE164: true }`
+   * `notE164` will be true if the input number 
    */
   async getPhoneNumRoom(
     control: string,
     e164: string,
     user?: string,
-  ): Promise<{ room: string, changed: boolean, intent: Intent }> {
+  ): Promise<{ room: string, changed: boolean, notE164: false, intent: Intent } | { notE164: true }> {
+    if (!phone.getPhoneNumberFromE164(e164)) {
+      return { notE164: true };
+    }
+
     const suffix = this.getTelSuffix(e164);
     const intent = this.getIntentForSuffix(suffix);
     const client = intent.underlyingClient;
@@ -823,10 +852,10 @@ export class Bridge extends Appservice {
       if (user && !(await client.getJoinedRoomMembers(room)).includes(user)) {
         log.debug(`Invited user ${user} to ${room}.`);
         await intent.underlyingClient.inviteUser(user, room);
-        return { room, changed: true, intent };
+        return { room, changed: true, notE164: false, intent };
       }
       log.debug(`Room ${room} already exists. Taking no action.`);
-      return { room, changed: false, intent };
+      return { room, changed: false, notE164: false, intent };
     }
 
     // TODO: Sync membership
@@ -849,6 +878,6 @@ export class Bridge extends Appservice {
     );
 
     await reconcileRoomState();
-    return { room, changed: true, intent };
+    return { room, changed: true, notE164: false, intent };
   }
 }
